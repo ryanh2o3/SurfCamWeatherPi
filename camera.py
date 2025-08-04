@@ -91,7 +91,7 @@ def check_streaming_requested():
     return False
 
 def stream_to_kinesis(credentials):
-    """Function to capture video and stream to Kinesis using the Producer SDK"""
+    """Function to capture video and stream to Kinesis"""
     global picam2, keep_running
     try:
         # Reconfigure global picam2 for video streaming
@@ -104,24 +104,59 @@ def stream_to_kinesis(credentials):
         
         print(f"[{datetime.now()}] Stream started with Picamera2")
         
-        # Import the KVS Producer SDK
-        from amazon_kinesis_video_streams_producer_sdk.producer import KvsProducer
-        
-        # Create a KVS Producer
-        kvs_producer = KvsProducer(
-            stream_name=KINESIS_STREAM_NAME,
-            access_key=credentials['accessKey'],
-            secret_key=credentials['secretKey'],
-            session_token=credentials['sessionToken'],
-            region=AWS_REGION
+        # Set up Kinesis client with provided credentials
+        kvs_client = boto3.client(
+            'kinesisvideo',
+            region_name=AWS_REGION,
+            aws_access_key_id=credentials['accessKey'],
+            aws_secret_access_key=credentials['secretKey'],
+            aws_session_token=credentials['sessionToken']
         )
         
-        # Start the producer
-        kvs_producer.start()
+        # Get an endpoint for the PutMedia API
+        endpoint_response = kvs_client.get_data_endpoint(
+            StreamName=KINESIS_STREAM_NAME,
+            APIName='PUT_MEDIA'
+        )
+        
+        endpoint = endpoint_response['DataEndpoint']
+        
+        # Create a client for PutMedia API
+        kvs_media_client = boto3.client(
+            'kinesis-video-media',
+            region_name=AWS_REGION,
+            aws_access_key_id=credentials['accessKey'],
+            aws_secret_access_key=credentials['secretKey'],
+            aws_session_token=credentials['sessionToken'],
+            endpoint_url=endpoint
+        )
+        
+        # Initialize video encoding with OpenCV and H.264
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
+        fps = 30
+        width, height = 1280, 720
+        
+        # Create temporary file for the encoded video fragment
+        import tempfile
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        
+        # Create VideoWriter to encode frames
+        video_writer = cv2.VideoWriter(
+            temp_file.name,
+            fourcc,
+            fps,
+            (width, height)
+        )
         
         # Stream parameters
-        fps = 30
-        frame_duration = int(1_000_000 / fps)  # Duration in microseconds
+        fragment_duration = 2  # seconds per fragment
+        frames_per_fragment = int(fps * fragment_duration)
+        frame_count = 0
+        fragment_number = 0
+        
+        # Use epoch time in milliseconds as the stream start reference
+        stream_start_time = int(datetime.now().timestamp() * 1000)
         
         print(f"[{datetime.now()}] Starting to stream to Kinesis Video Stream: {KINESIS_STREAM_NAME}")
         
@@ -129,29 +164,68 @@ def stream_to_kinesis(credentials):
             # Capture frame from camera
             frame = picam2.capture_array()
             
-            # Convert to BGR format for OpenCV
+            # OpenCV expects BGR format, but Picamera2 gives RGB
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             
-            # Encode frame to JPEG
-            _, encoded_frame = cv2.imencode('.jpg', frame_bgr)
-            frame_data = encoded_frame.tobytes()
+            # Write the frame to the video file
+            video_writer.write(frame_bgr)
             
-            # Get current timestamp in microseconds
-            timestamp = int(datetime.now().timestamp() * 1_000_000)
+            frame_count += 1
             
-            # Send frame to KVS
-            kvs_producer.put_frame(
-                frame_data=frame_data,
-                timestamp=timestamp,
-                flags=0  # No flags
-            )
+            # When we have enough frames for a fragment, send it to Kinesis
+            if frame_count >= frames_per_fragment:
+                # Release and close the video writer
+                video_writer.release()
+                temp_file.close()
+                
+                # Read the encoded video data
+                with open(temp_file.name, 'rb') as f:
+                    encoded_data = f.read()
+                
+                # Calculate timestamps
+                current_time = int(datetime.now().timestamp() * 1000)  # Current time in milliseconds
+                
+                # Calculate fragment timecode as the offset from stream start
+                # Each fragment should be positioned at its correct time offset
+                fragment_timecode = fragment_number * fragment_duration * 1000  # milliseconds
+                
+                try:
+                    # Send the fragment to Kinesis Video Streams
+                    kvs_media_client.put_media(
+                        StreamName=KINESIS_STREAM_NAME,
+                        Data=encoded_data,
+                        ProducerTimestamp=current_time,
+                        FragmentTimecode=str(fragment_timecode)
+                    )
+                    print(f"[{datetime.now()}] Successfully sent fragment {fragment_number} to Kinesis (timecode: {fragment_timecode}ms)")
+                    fragment_number += 1
+                except Exception as e:
+                    print(f"[{datetime.now()}] Error sending fragment to Kinesis: {str(e)}")
+                
+                # Create a new temporary file for the next fragment
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                
+                # Create a new VideoWriter for the next fragment
+                video_writer = cv2.VideoWriter(
+                    temp_file.name,
+                    fourcc,
+                    fps,
+                    (width, height)
+                )
+                
+                # Reset frame count
+                frame_count = 0
             
             # Sleep to maintain frame rate
             time.sleep(1/fps)
         
-        # Stop the producer
-        kvs_producer.stop()
-        
+        # Clean up
+        if video_writer:
+            video_writer.release()
+        if temp_file:
+            temp_file.close()
+            os.unlink(temp_file.name)
+            
         picam2.stop()
         print(f"[{datetime.now()}] Stream stopped")
         
