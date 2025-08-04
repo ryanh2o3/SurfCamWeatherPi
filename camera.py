@@ -92,7 +92,7 @@ def check_streaming_requested():
 
 def stream_to_kinesis(credentials):
     """Function to capture video and stream to Kinesis"""
-    global picam2
+    global picam2, keep_running
     try:
         # Reconfigure global picam2 for video streaming
         if picam2 is None:
@@ -105,7 +105,7 @@ def stream_to_kinesis(credentials):
         print(f"[{datetime.now()}] Stream started with Picamera2")
         
         # Set up Kinesis client with provided credentials
-        client = boto3.client(
+        kvs_client = boto3.client(
             'kinesisvideo',
             region_name=AWS_REGION,
             aws_access_key_id=credentials['accessKey'],
@@ -113,12 +113,111 @@ def stream_to_kinesis(credentials):
             aws_session_token=credentials['sessionToken']
         )
         
-        # TODO: Configure proper Kinesis video streaming
+        # Get an endpoint for the PutMedia API
+        endpoint_response = kvs_client.get_data_endpoint(
+            StreamName=KINESIS_STREAM_NAME,
+            APIName='PUT_MEDIA'
+        )
+        
+        endpoint = endpoint_response['DataEndpoint']
+        
+        # Create a client for PutMedia API
+        kvs_media_client = boto3.client(
+            'kinesis-video-media',
+            region_name=AWS_REGION,
+            aws_access_key_id=credentials['accessKey'],
+            aws_secret_access_key=credentials['secretKey'],
+            aws_session_token=credentials['sessionToken'],
+            endpoint_url=endpoint
+        )
+        
+        # Initialize video encoding with OpenCV and H.264
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
+        fps = 30
+        width, height = 1280, 720
+        
+        # Create temporary file for the encoded video fragment
+        import tempfile
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        
+        # Create VideoWriter to encode frames
+        video_writer = cv2.VideoWriter(
+            temp_file.name,
+            fourcc,
+            fps,
+            (width, height)
+        )
+        
+        # Stream parameters
+        fragment_duration = 2  # seconds per fragment
+        frames_per_fragment = int(fps * fragment_duration)
+        frame_count = 0
+        
+        start_timestamp = datetime.now().timestamp() * 1000  # Convert to milliseconds
+        
+        print(f"[{datetime.now()}] Starting to stream to Kinesis Video Stream: {KINESIS_STREAM_NAME}")
         
         while keep_running:
+            # Capture frame from camera
             frame = picam2.capture_array()
-            print(f"[{datetime.now()}] Frame captured: {frame.shape}")
-            time.sleep(0.033)  # ~30 FPS
+            
+            # OpenCV expects BGR format, but Picamera2 gives RGB
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Write the frame to the video file
+            video_writer.write(frame_bgr)
+            
+            frame_count += 1
+            
+            # When we have enough frames for a fragment, send it to Kinesis
+            if frame_count >= frames_per_fragment:
+                # Release and close the video writer
+                video_writer.release()
+                temp_file.close()
+                
+                # Read the encoded video data
+                with open(temp_file.name, 'rb') as f:
+                    encoded_data = f.read()
+                
+                # Calculate timestamps
+                current_time = datetime.now().timestamp() * 1000  # Convert to milliseconds
+                
+                try:
+                    # Send the fragment to Kinesis Video Streams
+                    kvs_media_client.put_media(
+                        StreamName=KINESIS_STREAM_NAME,
+                        Data=encoded_data,
+                        ProducerTimestamp=int(current_time),
+                        FragmentTimecode=str(int(current_time - start_timestamp))
+                    )
+                    print(f"[{datetime.now()}] Successfully sent fragment to Kinesis")
+                except Exception as e:
+                    print(f"[{datetime.now()}] Error sending fragment to Kinesis: {str(e)}")
+                
+                # Create a new temporary file for the next fragment
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                
+                # Create a new VideoWriter for the next fragment
+                video_writer = cv2.VideoWriter(
+                    temp_file.name,
+                    fourcc,
+                    fps,
+                    (width, height)
+                )
+                
+                # Reset frame count
+                frame_count = 0
+            
+            # Sleep to maintain frame rate
+            time.sleep(1/fps)
+        
+        # Clean up
+        if video_writer:
+            video_writer.release()
+        if temp_file:
+            temp_file.close()
+            os.unlink(temp_file.name)
             
         picam2.stop()
         print(f"[{datetime.now()}] Stream stopped")
@@ -129,6 +228,8 @@ def stream_to_kinesis(credentials):
         
     except Exception as e:
         print(f"[{datetime.now()}] Error in streaming thread: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def start_kinesis_stream():
     """Start streaming to AWS Kinesis using Picamera2"""
