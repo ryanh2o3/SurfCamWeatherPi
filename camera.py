@@ -41,30 +41,60 @@ def take_picture():
     """Take a picture and send it to the backend using Picamera2"""
     global picam2
     try:
+        # Make sure camera is properly initialized
         init_picamera2()
-        picam2.capture_file(IMAGE_PATH)
+        
+        # Add a small delay to ensure camera is ready
+        time.sleep(0.5)
+        
+        # Explicitly specify the format as JPEG
+        picam2.capture_file(IMAGE_PATH, format="jpg")
+        
+        # Verify the image file exists and has content
+        if not os.path.exists(IMAGE_PATH):
+            print(f"[{datetime.now()}] Error: Image file was not created")
+            return
+            
+        file_size = os.path.getsize(IMAGE_PATH)
+        if file_size <= 0:
+            print(f"[{datetime.now()}] Error: Image file is empty (0 bytes)")
+            return
+        
+        print(f"[{datetime.now()}] Image captured successfully: {file_size} bytes")
         
         # Read the image bytes
         with open(IMAGE_PATH, "rb") as f:
             image_bytes = f.read()
-            
+        
+        # Basic validation of image format (check for JPEG header)
+        if not image_bytes.startswith(b'\xff\xd8'):
+            print(f"[{datetime.now()}] Warning: File does not appear to be a valid JPEG")
+        
         # Upload to backend
         files = {'file': ('snapshot.jpg', image_bytes, 'image/jpeg')}
         headers = {'Authorization': f'ApiKey {API_KEY}'}
         data = {'timestamp': datetime.now().isoformat(), 'spot_id': "Ireland_Donegal_Ballymastocker"}
 
-        response = requests.post(f"{API_ENDPOINT}/upload-snapshot", 
-                               files=files, 
-                               data=data,
-                               headers=headers)
+        response = requests.post(
+            f"{API_ENDPOINT}/upload-snapshot",
+            files=files, 
+            data=data,
+            headers=headers,
+            timeout=30  # Add timeout to prevent hanging requests
+        )
         
-        if response.status_code == 200:    
+        if response.status_code == 200:
             print(f"[{datetime.now()}] Snapshot uploaded successfully!")
         else:
             print(f"[{datetime.now()}] Failed to upload snapshot. Status code: {response.status_code}")
-            print(response.json())
+            try:
+                print(response.json())
+            except:
+                print(f"Response content: {response.text[:200]}...")
     except Exception as e:
         print(f"[{datetime.now()}] Error capturing or uploading snapshot: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def check_streaming_requested():
     """Check if streaming is requested from the backend"""
