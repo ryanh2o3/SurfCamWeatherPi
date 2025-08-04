@@ -3,7 +3,6 @@ import base64
 import json
 import time
 import io
-from PIL import Image
 import os
 import subprocess
 import boto3
@@ -11,6 +10,7 @@ import threading
 from datetime import datetime
 import signal
 import sys
+from picamera2 import Picamera2
 
 # Configuration
 API_ENDPOINT = "https://treblesurf.com/api"
@@ -26,16 +26,23 @@ streaming_process = None
 keep_running = True
 last_stream_request_time = 0
 stream_timeout = 30  # seconds to keep streaming without new requests
+stream_thread = None  # Add this line
 
-def take_picture():
-    """Take a picture and send it to the backend using Picamera2"""
-    try:
-        # Use Picamera2 to capture an image
+picam2 = None
+
+def init_picamera2():
+    global picam2
+    if picam2 is None:
         picam2 = Picamera2()
         picam2.configure(picam2.create_still_configuration())
         picam2.start()
+
+def take_picture():
+    """Take a picture and send it to the backend using Picamera2"""
+    global picam2
+    try:
+        init_picamera2()
         picam2.capture_file(IMAGE_PATH)
-        picam2.stop()
         
         # Read the image bytes
         with open(IMAGE_PATH, "rb") as f:
@@ -55,6 +62,7 @@ def take_picture():
             print(f"[{datetime.now()}] Snapshot uploaded successfully!")
         else:
             print(f"[{datetime.now()}] Failed to upload snapshot. Status code: {response.status_code}")
+            print(response.json())
     except Exception as e:
         print(f"[{datetime.now()}] Error capturing or uploading snapshot: {str(e)}")
 
@@ -69,7 +77,7 @@ def check_streaming_requested():
         
         if response.status_code == 200:
             data = response.json()
-            if data.get('streaming_requested', False):
+            if data.get('stream_requested', False):
                 print(f"[{datetime.now()}] Streaming requested!")
                 last_stream_request_time = time.time()
                 return True
@@ -84,9 +92,12 @@ def check_streaming_requested():
 
 def stream_to_kinesis(credentials):
     """Function to capture video and stream to Kinesis"""
+    global picam2
     try:
-        # Initialize Picamera2 for video streaming
-        picam2 = Picamera2()
+        # Reconfigure global picam2 for video streaming
+        if picam2 is None:
+            picam2 = Picamera2()
+        picam2.stop()  # Stop if running in still mode
         video_config = picam2.create_video_configuration(main={"size": (1280, 720)})
         picam2.configure(video_config)
         picam2.start()
@@ -103,21 +114,18 @@ def stream_to_kinesis(credentials):
         )
         
         # TODO: Configure proper Kinesis video streaming
-        # This is a placeholder - in a real implementation, you'd need to:
-        # 1. Format the frames correctly for Kinesis
-        # 2. Use the Kinesis Video Streams Producer SDK to send them
         
         while keep_running:
             frame = picam2.capture_array()
-            
-            # Process frame and send to Kinesis
-            # For now, just show we're capturing frames
             print(f"[{datetime.now()}] Frame captured: {frame.shape}")
-            
             time.sleep(0.033)  # ~30 FPS
             
         picam2.stop()
         print(f"[{datetime.now()}] Stream stopped")
+        
+        # Reconfigure for stills after streaming ends
+        picam2.configure(picam2.create_still_configuration())
+        picam2.start()
         
     except Exception as e:
         print(f"[{datetime.now()}] Error in streaming thread: {str(e)}")
@@ -196,6 +204,7 @@ def signal_handler(sig, frame):
 
 def main():
     """Main function to start the threads"""
+    global keep_running
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
