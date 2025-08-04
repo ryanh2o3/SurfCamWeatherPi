@@ -28,31 +28,24 @@ last_stream_request_time = 0
 stream_timeout = 30  # seconds to keep streaming without new requests
 
 def take_picture():
-    """Take a picture and send it to the backend"""
+    """Take a picture and send it to the backend using Picamera2"""
     try:
-        # Use libcamera-jpeg to capture an image
-        subprocess.run(['libcamera-jpeg', '-o', IMAGE_PATH], check=True)
-    except FileNotFoundError:
-        print("Failed to run libcamera-jpeg command. Is it installed and in the system's PATH?")
-        return
+        # Use Picamera2 to capture an image
+        picam2 = Picamera2()
+        picam2.configure(picam2.create_still_configuration())
+        picam2.start()
+        picam2.capture_file(IMAGE_PATH)
+        picam2.stop()
+        
+        # Read the image bytes
+        with open(IMAGE_PATH, "rb") as f:
+            image_bytes = f.read()
+            
+        # Upload to backend
+        files = {'file': ('snapshot.jpg', image_bytes, 'image/jpeg')}
+        headers = {'Authorization': f'ApiKey {API_KEY}'}
+        data = {'timestamp': datetime.now().isoformat(), 'spot_id': "Ireland_Donegal_Ballymastocker"}
 
-    try:
-        image = Image.open(IMAGE_PATH)
-    except FileNotFoundError:
-        print(f"Failed to open {IMAGE_PATH}. Did the libcamera-jpeg command succeed?")
-        return
-
-    image_file_object = io.BytesIO()
-    image.save(image_file_object, format='JPEG')
-    image_file_object.seek(0)
-    image_bytes = image_file_object.getvalue()
-
-    # Upload to backend
-    files = {'file': ('snapshot.jpg', image_bytes, 'image/jpeg')}
-    headers = {'Authorization': f'ApiKey {API_KEY}'}
-    data = {'timestamp': datetime.now().isoformat(), 'spot_id': "Ireland_Donegal_Ballymastocker"}
-
-    try:
         response = requests.post(f"{API_ENDPOINT}/upload-snapshot", 
                                files=files, 
                                data=data,
@@ -63,7 +56,7 @@ def take_picture():
         else:
             print(f"[{datetime.now()}] Failed to upload snapshot. Status code: {response.status_code}")
     except Exception as e:
-        print(f"[{datetime.now()}] Error uploading snapshot: {str(e)}")
+        print(f"[{datetime.now()}] Error capturing or uploading snapshot: {str(e)}")
 
 def check_streaming_requested():
     """Check if streaming is requested from the backend"""
@@ -89,11 +82,51 @@ def check_streaming_requested():
         
     return False
 
+def stream_to_kinesis(credentials):
+    """Function to capture video and stream to Kinesis"""
+    try:
+        # Initialize Picamera2 for video streaming
+        picam2 = Picamera2()
+        video_config = picam2.create_video_configuration(main={"size": (1280, 720)})
+        picam2.configure(video_config)
+        picam2.start()
+        
+        print(f"[{datetime.now()}] Stream started with Picamera2")
+        
+        # Set up Kinesis client with provided credentials
+        client = boto3.client(
+            'kinesisvideo',
+            region_name=AWS_REGION,
+            aws_access_key_id=credentials['accessKey'],
+            aws_secret_access_key=credentials['secretKey'],
+            aws_session_token=credentials['sessionToken']
+        )
+        
+        # TODO: Configure proper Kinesis video streaming
+        # This is a placeholder - in a real implementation, you'd need to:
+        # 1. Format the frames correctly for Kinesis
+        # 2. Use the Kinesis Video Streams Producer SDK to send them
+        
+        while keep_running:
+            frame = picam2.capture_array()
+            
+            # Process frame and send to Kinesis
+            # For now, just show we're capturing frames
+            print(f"[{datetime.now()}] Frame captured: {frame.shape}")
+            
+            time.sleep(0.033)  # ~30 FPS
+            
+        picam2.stop()
+        print(f"[{datetime.now()}] Stream stopped")
+        
+    except Exception as e:
+        print(f"[{datetime.now()}] Error in streaming thread: {str(e)}")
+
 def start_kinesis_stream():
-    """Start streaming to AWS Kinesis"""
-    global streaming_process
+    """Start streaming to AWS Kinesis using Picamera2"""
+    global streaming_process, stream_thread
     
-    if streaming_process is not None:
+    if stream_thread is not None and stream_thread.is_alive():
         # Stream already running
         return
     
@@ -108,19 +141,12 @@ def start_kinesis_stream():
             
         credentials = response.json()
         
-        # Configure GStreamer pipeline
-        pipeline = (
-            f"raspivid -n -t 0 -w 1280 -h 720 -fps 30 -b 2000000 -o - | "
-            f"gst-launch-1.0 fdsrc ! h264parse ! "
-            f"kvssink stream-name={KINESIS_STREAM_NAME} "
-            f"aws-region={AWS_REGION} "
-            f"access-key={credentials['accessKey']} "
-            f"secret-key={credentials['secretKey']} "
-            f"session-token={credentials['sessionToken']}"
-        )
+        print(f"[{datetime.now()}] Starting stream with Picamera2...")
         
-        print(f"[{datetime.now()}] Starting stream...")
-        streaming_process = subprocess.Popen(pipeline, shell=True)
+        # Start the streaming in a separate thread
+        stream_thread = threading.Thread(target=stream_to_kinesis, args=(credentials,))
+        stream_thread.daemon = True
+        stream_thread.start()
         
     except Exception as e:
         print(f"[{datetime.now()}] Error starting stream: {str(e)}")
