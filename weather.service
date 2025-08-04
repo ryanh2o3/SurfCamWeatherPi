@@ -1,0 +1,12 @@
+[Unit]
+Description=Weather station
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/ryanpatton/WeatherPi/weatherPi.py
+WorkingDirectory=/home/ryanpatton/WeatherPi/
+Restart=always
+User=ryanpatton
+
+[Install]
+WantedBy=multi-user.target
