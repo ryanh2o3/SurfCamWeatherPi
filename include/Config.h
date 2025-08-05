@@ -1,0 +1,46 @@
+#pragma once
+
+#include <string>
+#include <chrono>
+
+namespace SurfCam {
+
+struct Config {
+    static const std::string API_ENDPOINT;
+    static const std::string API_KEY;
+    static const std::chrono::seconds SNAPSHOT_INTERVAL;
+    static const std::chrono::seconds STREAM_CHECK_INTERVAL;
+    static const std::string AWS_REGION;
+    static const std::string KINESIS_STREAM_NAME;
+    static const std::string IMAGE_PATH;
+    static const std::chrono::seconds STREAM_TIMEOUT;
+    
+    static const int CAMERA_WIDTH;
+    static const int CAMERA_HEIGHT;
+    static const int STREAM_FPS;
+
+    static const int MAX_FRAGMENT_SIZE;
+    static const int KVS_STORAGE_SIZE;
+    static const int GSTREAMER_BITRATE;
+    static const std::string SPOT_ID;
+    static const int REQUEST_TIMEOUT;
+};
+
+const std::string Config::API_ENDPOINT = "https://treblesurf.com/api";
+const std::string Config::API_KEY = std::getenv("API_KEY") ? std::getenv("API_KEY") : "REQUIRES_API_KEY_ENV_VAR";
+const std::chrono::seconds Config::SNAPSHOT_INTERVAL{30};
+const std::chrono::seconds Config::STREAM_CHECK_INTERVAL{5};
+const std::string Config::AWS_REGION = "eu-west-1";
+const std::string Config::KINESIS_STREAM_NAME = "treblesurf-webcam";
+const std::string Config::IMAGE_PATH = "/home/ryanpatton/image.jpg";
+const std::chrono::seconds Config::STREAM_TIMEOUT{30};
+const int Config::CAMERA_WIDTH = 1280;
+const int Config::CAMERA_HEIGHT = 720;
+const int Config::STREAM_FPS = 15;
+const int Config::MAX_FRAGMENT_SIZE = 256 * 1024; // 256KB fragments for Pi Zero
+const int Config::KVS_STORAGE_SIZE = 32 * 1024 * 1024; // 32MB instead of 128MB
+const int Config::GSTREAMER_BITRATE = 400000; // 500Kbps for Pi Zero
+const std::string Config::SPOT_ID = "Ireland_Donegal_Ballymastocker";
+const int Config::REQUEST_TIMEOUT = 10; // 10 seconds timeout for network requests
+
+}  // namespace SurfCam
