@@ -4,7 +4,6 @@ project(SurfCamWeatherPi VERSION 1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")  # Add optimization flag for Pi Zero
 
-find_package(libcamera REQUIRED)
 find_package(CURL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(aws-cpp-sdk-core REQUIRED)
@@ -12,6 +11,7 @@ find_package(aws-cpp-sdk-kinesisvideo REQUIRED)
 find_package(aws-cpp-sdk-kinesis-video-media REQUIRED)
 find_package(KinesisVideoProducerCpp REQUIRED)
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBCAMERA REQUIRED libcamera)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
 
 
@@ -22,6 +22,16 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
     ${GSTREAMER_INCLUDE_DIRS}
 
+)
+
+link_directories(
+    ${LIBCAMERA_LIBRARY_DIRS}
+    ${GSTREAMER_LIBRARY_DIRS}
+)
+
+add_definitions(
+    ${LIBCAMERA_CFLAGS_OTHER}
+    ${GSTREAMER_CFLAGS_OTHER}
 )
 
 add_executable(surfcam
