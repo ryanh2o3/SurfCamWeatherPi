@@ -1,0 +1,47 @@
+# Build directories
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# Compiled binaries
+surfcam
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+surfcam.log
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+*.key
+*.pem
+secrets/
+
+# API keys and credentials (if stored in files)
+*credentials*
+*secrets*
+
+# Test images
+test.jpg
+test_*.jpg
+*.jpg
+*.png
+!README*.png
+!docs/*.png
+
