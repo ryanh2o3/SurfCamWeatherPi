@@ -1,146 +1,144 @@
 # SurfCam Weather Pi
 
-A Raspberry Pi application that captures surf conditions at Ballymastocker Bay, Ireland, and streams live video to AWS Kinesis Video Streams while periodically uploading still snapshots.
+A Raspberry Pi app that captures surf conditions at Ballymastocker Bay, Ireland. It takes photos every 30 seconds and can stream live video when someone requests it.
 
-## Overview
+## What it does
 
-SurfCam Weather Pi is designed to run on a Raspberry Pi Zero W (or compatible) with a camera module. It continuously captures surf conditions and provides two modes of operation:
+This runs on a Raspberry Pi Zero W with a camera. It does two main things:
 
-- **Snapshot Mode**: Takes still images every 30 seconds and uploads them to a remote API
-- **Live Streaming**: On-demand live video streaming to AWS Kinesis Video Streams when requested via the API
+- **Takes snapshots**: Every 30 seconds it snaps a photo and uploads it to an API
+- **Streams video**: When someone asks for it, it streams live video to AWS Kinesis
 
-The application is optimized for the resource-constrained Raspberry Pi Zero, with features like:
+Since the Pi Zero is pretty limited, the app keeps an eye on things like:
 
-- Memory management and monitoring
-- CPU temperature monitoring
-- Automatic stream timeout handling
-- GStreamer H.264 encoding pipeline
-- Thread-safe camera management
+- Memory usage (so it doesn't crash)
+- CPU temperature (so it doesn't overheat)
+- Automatically stops streaming after a while if no one's watching
+- Uses GStreamer to encode video efficiently
+- Handles the camera safely across multiple threads
 
-## Architecture
+## How it's built
 
-The application is built in C++17 and consists of several key components:
-
-### Components
+Written in C++17. Here's what the main pieces do:
 
 1. **CameraManager** (`src/CameraManager.cpp`)
 
-   - Manages camera initialization and control using libcamera
-   - Handles both still capture and video mode
-   - Manages GStreamer pipeline for H.264 encoding
-   - Thread-safe buffer management
+   - Talks to the camera using libcamera
+   - Takes photos and records video
+   - Sets up GStreamer to encode video as H.264
+   - Keeps things safe when multiple threads use the camera
 
 2. **ApiClient** (`src/ApiClient.cpp`)
 
-   - Handles HTTP communication with the remote API
-   - Manages snapshot uploads
-   - Retrieves streaming credentials
-   - Checks for streaming requests
+   - Sends HTTP requests to the API
+   - Uploads photos
+   - Gets AWS credentials when needed
+   - Checks if anyone wants to watch a stream
 
 3. **KinesisStreamer** (`src/KinesisStreamer.cpp`)
 
-   - Manages AWS Kinesis Video Streams connection
-   - Handles video frame encoding and upload
-   - Manages temporal fragmentation of video streams
+   - Connects to AWS Kinesis Video Streams
+   - Encodes and uploads video frames
+   - Breaks video into chunks that Kinesis can handle
 
 4. **Main Application** (`src/main.cpp`)
-   - Coordinates all components
-   - Manages worker threads for snapshots and streaming
-   - Monitors system resources (memory and temperature)
-   - Handles graceful shutdown
+   - Keeps everything working together
+   - Runs threads for taking photos and streaming
+   - Watches memory and temperature
+   - Shuts down cleanly when needed
 
-## Dependencies
+## What you need
 
-### System Requirements
+### Hardware
 
-- Raspberry Pi Zero W (or compatible)
+- Raspberry Pi Zero W (or similar)
 - Raspberry Pi Camera Module V2 or V3
-- Raspbian OS or similar Linux distribution
-- Network connectivity
+- Raspbian OS or similar Linux distro
+- Internet connection
 
-### Build Dependencies
+### Software to build it
 
-- CMake 3.10 or higher
-- C++17 compatible compiler (gcc or clang)
-- OpenCV (for image processing)
-- libcamera (camera interface)
-- GStreamer 1.0 (H.264 encoding)
-- AWS C++ SDK (Kinesis Video Streams)
-- libcurl (HTTP client)
+- CMake 3.10+
+- C++17 compiler (gcc or clang)
+- OpenCV
+- libcamera
+- GStreamer 1.0
+- AWS C++ SDK
+- libcurl
 - pthread
 
-### Installation on Raspberry Pi
+### Installing on Raspberry Pi
 
 ```bash
-# Update system
+# Update everything
 sudo apt update && sudo apt upgrade -y
 
-# Install build tools
+# Get build tools
 sudo apt install -y build-essential cmake git pkg-config
 
-# Install camera libraries
+# Camera stuff
 sudo apt install -y libcamera-dev libcamera-apps
 
-# Install OpenCV
+# OpenCV
 sudo apt install -y libopencv-dev
 
-# Install GStreamer
+# GStreamer
 sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
-# Install curl
+# HTTP client
 sudo apt install -y libcurl4-openssl-dev
 
-# Install AWS SDK dependencies
-# (Follow AWS C++ SDK installation instructions)
-# See: https://github.com/aws/aws-sdk-cpp/blob/master/Docs/CMake_Parameters.md
+# AWS SDK
+# You'll need to follow the AWS C++ SDK installation guide:
+# https://github.com/aws/aws-sdk-cpp/blob/master/Docs/CMake_Parameters.md
 
-# Install nlohmann/json
+# JSON library
 sudo apt install -y nlohmann-json3-dev
 ```
 
 ## Building
 
 ```bash
-# Clone the repository (if not already done)
+# Go to the project directory
 cd /path/to/SurfCamWeatherPi
 
-# Create build directory
+# Make a build folder
 mkdir build && cd build
 
-# Configure with CMake
+# Configure
 cmake ..
 
-# Build
+# Build it
 make -j4
 
-# Install (optional)
+# Install (if you want)
 sudo make install
 ```
 
 ## Configuration
 
-Configuration is managed in `include/Config.h`. Key settings include:
+Settings are in `include/Config.h`. You can change:
 
 ```cpp
-- SNAPSHOT_INTERVAL: How often to take snapshots (default: 30 seconds)
-- STREAM_CHECK_INTERVAL: How often to check for streaming requests (default: 5 seconds)
-- CAMERA_WIDTH/HEIGHT: Video resolution (default: 1280x720)
-- STREAM_FPS: Frame rate for streaming (default: 15 fps)
-- API_ENDPOINT: Base URL for the API
+- SNAPSHOT_INTERVAL: How often to take photos (default: 30 seconds)
+- STREAM_CHECK_INTERVAL: How often to check if someone wants to stream (default: 5 seconds)
+- CAMERA_WIDTH/HEIGHT: Video size (default: 1280x720)
+- STREAM_FPS: Video frame rate (default: 15 fps)
+- API_ENDPOINT: Where to send photos
 - KINESIS_STREAM_NAME: AWS Kinesis stream name
 - AWS_REGION: AWS region
-- SPOT_ID: Surf spot identifier
+- SPOT_ID: Which surf spot this is
 ```
 
 ### Environment Variables
 
-- `API_KEY`: API authentication key (set in `script.sh` or as environment variable)
+- `API_KEY`: Your API key (set in `script.sh` or as an environment variable)
 
-## Deployment
+## Running it
 
-### Systemd Service
+### As a service
 
-1. Create a service file at `/etc/systemd/system/surfcam.service`:
+1. Create `/etc/systemd/system/surfcam.service`:
 
 ```ini
 [Unit]
@@ -159,7 +157,7 @@ User=ryanpatton
 WantedBy=multi-user.target
 ```
 
-2. Enable and start the service:
+2. Start it up:
 
 ```bash
 sudo systemctl daemon-reload
@@ -167,144 +165,144 @@ sudo systemctl enable surfcam.service
 sudo systemctl start surfcam.service
 ```
 
-3. Check status:
+3. See if it's running:
 
 ```bash
 sudo systemctl status surfcam.service
 ```
 
-### Manual Startup Script
+### Running manually
 
-The included `script.sh` handles:
+The `script.sh` file does a few helpful things:
 
-- Setting environment variables
-- Waiting for network connectivity
-- Waiting for camera availability
-- Killing any existing instances
-- Redirecting output to log file
+- Sets up environment variables
+- Waits for internet connection
+- Waits for the camera to be ready
+- Kills any old instances
+- Sends output to a log file
 
-To use it manually:
+To run it:
 
 ```bash
 chmod +x script.sh
 ./script.sh
 ```
 
-## Operation
+## How it works
 
-### Normal Operation
+### Normal operation
 
-The application runs continuously with three main threads:
+It runs three threads that keep things going:
 
-1. **Snapshot Thread**: Periodically captures and uploads still images
-2. **Stream Check Thread**: Monitors for streaming requests and manages stream lifecycle
-3. **Monitor Thread**: Watches system resources and temperature
+1. **Snapshot thread**: Takes photos and uploads them
+2. **Stream check thread**: Looks for streaming requests and handles streams
+3. **Monitor thread**: Keeps an eye on memory and temperature
 
 ### Streaming
 
-When a streaming request is received from the API:
+When someone wants to watch:
 
-1. Application fetches AWS credentials from the API
-2. Initializes Kinesis Video Streams connection
-3. Starts video capture mode with H.264 encoding
-4. Streams video in fragments to Kinesis
-5. Automatically stops after 30 seconds of inactivity
+1. Gets AWS credentials from the API
+2. Connects to Kinesis Video Streams
+3. Starts recording video with H.264 encoding
+4. Sends video chunks to Kinesis
+5. Stops automatically after 30 seconds if no one's watching
 
-### Resource Management
+### Keeping things stable
 
-The application includes several resource management features:
+Since the Pi Zero is small, the app watches out for problems:
 
-- **Memory Monitoring**: Checks available memory every 30 seconds and can shut down streaming if memory is critically low
-- **Temperature Monitoring**: Monitors CPU temperature and can shut down streaming if overheating is detected
-- **Automatic Recovery**: Attempts to recover from camera failures and network issues
-- **Fragment Size Limits**: Limits video fragment size to prevent memory exhaustion
+- **Memory**: Checks every 30 seconds and stops streaming if memory gets too low
+- **Temperature**: Watches CPU temp and stops streaming if it gets too hot
+- **Recovery**: Tries to fix itself if the camera or network has issues
+- **Fragment limits**: Keeps video chunks small so it doesn't run out of memory
 
 ## Troubleshooting
 
-### Camera Not Detected
+### Camera not working?
 
 ```bash
-# Check if camera is detected
+# See if the camera shows up
 libcamera-hello --list-cameras
 
-# Test camera capture
+# Try taking a test photo
 libcamera-still -o test.jpg
 ```
 
-### Build Issues
+### Build problems
 
 ```bash
-# Clean build directory
+# Clean everything and rebuild
 rm -rf build/*
 cmake ..
 make clean
 make
 ```
 
-### Runtime Issues
+### Something's not working?
 
-Check logs:
+Check the logs:
 
 ```bash
 tail -f /home/ryanpatton/surfcam.log
 ```
 
-Or systemd logs:
+Or if running as a service:
 
 ```bash
 journalctl -u surfcam.service -f
 ```
 
-### Network Issues
+### Network problems
 
 ```bash
-# Test API connectivity
+# Test if you can reach the API
 curl -X POST https://treblesurf.com/api/upload-snapshot
 ```
 
-### Streaming Issues
+### Streaming not working?
 
-- Verify AWS credentials are valid
-- Check Kinesis stream exists in the correct region
-- Ensure network bandwidth is sufficient
-- Check Pi Zero isn't overheating
+- Make sure AWS credentials are correct
+- Check the Kinesis stream exists in the right region
+- Make sure your internet is fast enough
+- Check if the Pi is overheating
 
-## Performance Optimization
+## Pi Zero tweaks
 
-The application is optimized specifically for Raspberry Pi Zero:
+Since the Pi Zero is pretty slow, I've made some adjustments:
 
-- Reduced fragment sizes (256KB vs default)
-- Reduced storage size (32MB vs 128MB)
-- Lower bitrate encoding (400Kbps)
-- Increased timeouts for slow network
-- Reduced frame buffering
-- CPU throttling prevention
+- Smaller video chunks (256KB instead of the default)
+- Less storage used (32MB instead of 128MB)
+- Lower video quality (400Kbps bitrate)
+- Longer timeouts for slow internet
+- Less frame buffering
+- Tries to prevent CPU throttling
 
-## API Integration
+## API endpoints
 
-### Endpoints Used
+The app talks to these endpoints:
 
-- `POST /api/upload-snapshot`: Upload still image
+- `POST /api/upload-snapshot`: Upload a photo
 
   - Body: multipart/form-data with file, timestamp, spot_id
   - Headers: `Authorization: ApiKey <key>`
 
-- `GET /api/is-streaming-requested?spot_id=<id>`: Check if streaming requested
+- `GET /api/is-streaming-requested?spot_id=<id>`: Check if someone wants to stream
 
-  - Returns JSON with streaming status
+  - Returns JSON saying yes or no
 
 - `GET /api/get-streaming-credentials`: Get AWS credentials for streaming
   - Returns JSON with AWS credentials
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0. See the [LICENSE](LICENSE) file for details.
+GNU Affero General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 ## Author
 
 Ryan Patton
 
-## Acknowledgments
+## Thanks
 
 - Raspberry Pi Foundation for the camera module and libcamera
 - AWS for Kinesis Video Streams
