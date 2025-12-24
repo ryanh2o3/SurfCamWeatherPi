@@ -20,6 +20,9 @@
 
 #include <string>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 
 namespace SurfCam {
 
@@ -45,7 +48,15 @@ struct Config {
 };
 
 const std::string Config::API_ENDPOINT = "https://treblesurf.com/api";
-const std::string Config::API_KEY = std::getenv("API_KEY") ? std::getenv("API_KEY") : "REQUIRES_API_KEY_ENV_VAR";
+const std::string Config::API_KEY = []() {
+    const char* env_key = std::getenv("API_KEY");
+    if (!env_key || strlen(env_key) == 0) {
+        std::cerr << "ERROR: API_KEY environment variable is not set!" << std::endl;
+        std::cerr << "Please set it before running the application." << std::endl;
+        exit(1);
+    }
+    return std::string(env_key);
+}();
 const std::chrono::seconds Config::SNAPSHOT_INTERVAL{30};
 const std::chrono::seconds Config::STREAM_CHECK_INTERVAL{5};
 const std::string Config::AWS_REGION = "eu-west-1";
