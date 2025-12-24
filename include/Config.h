@@ -69,7 +69,15 @@ const int Config::STREAM_FPS = 15;
 const int Config::MAX_FRAGMENT_SIZE = 256 * 1024; // 256KB fragments for Pi Zero
 const int Config::KVS_STORAGE_SIZE = 32 * 1024 * 1024; // 32MB instead of 128MB
 const int Config::GSTREAMER_BITRATE = 400000; // 500Kbps for Pi Zero
-const std::string Config::SPOT_ID = "Ireland_Donegal_Ballymastocker";
+const std::string Config::SPOT_ID = []() {
+    const char* env_spot_id = std::getenv("SPOT_ID");
+    if (!env_spot_id || strlen(env_spot_id) == 0) {
+        std::cerr << "ERROR: SPOT_ID environment variable is not set!" << std::endl;
+        std::cerr << "Please set it before running the application." << std::endl;
+        exit(1);
+    }
+    return std::string(env_spot_id);
+}();
 const int Config::REQUEST_TIMEOUT = 10; // 10 seconds timeout for network requests
 
 }  // namespace SurfCam

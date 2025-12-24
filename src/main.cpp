@@ -58,7 +58,7 @@ void snapshotWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
         std::cout << "[" << getCurrentTimeString() << "] Taking snapshot..." << std::endl;
         
         if (camera.takePicture(SurfCam::Config::IMAGE_PATH)) {
-            if (api.uploadSnapshot(SurfCam::Config::IMAGE_PATH, "Ireland_Donegal_Ballymastocker")) {
+            if (api.uploadSnapshot(SurfCam::Config::IMAGE_PATH, SurfCam::Config::SPOT_ID)) {
                 std::cout << "[" << getCurrentTimeString() << "] Snapshot uploaded successfully!" << std::endl;
             } else {
                 std::cout << "[" << getCurrentTimeString() << "] Failed to upload snapshot." << std::endl;

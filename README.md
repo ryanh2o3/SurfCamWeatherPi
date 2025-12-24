@@ -1,6 +1,6 @@
 # SurfCam Weather Pi
 
-A Raspberry Pi app that captures surf conditions at Ballymastocker Bay, Ireland. It takes photos every 30 seconds and can stream live video when someone requests it.
+A Raspberry Pi app that captures surf conditions and streams live video. It takes photos every 30 seconds and can stream live video when someone requests it.
 
 ## What it does
 
@@ -127,12 +127,12 @@ Settings are in `include/Config.h`. You can change:
 - API_ENDPOINT: Where to send photos
 - KINESIS_STREAM_NAME: AWS Kinesis stream name
 - AWS_REGION: AWS region
-- SPOT_ID: Which surf spot this is
 ```
 
 ### Environment Variables
 
 - `API_KEY`: Your API key (set in `script.sh` or as an environment variable)
+- `SPOT_ID`: The identifier for your surf spot (e.g., "Ireland_Donegal_Ballymastocker")
 
 ## Running it
 
@@ -301,10 +301,3 @@ GNU Affero General Public License v3.0. See [LICENSE](LICENSE) for details.
 ## Author
 
 Ryan Patton
-
-## Thanks
-
-- Raspberry Pi Foundation for the camera module and libcamera
-- AWS for Kinesis Video Streams
-- OpenCV community
-- GStreamer developers

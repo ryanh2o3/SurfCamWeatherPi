@@ -18,6 +18,7 @@
 
 # Set environment variables
 export API_KEY="your_api_key_here"
+export SPOT_ID="your_spot_id_here"
 export LD_LIBRARY_PATH=/usr/local/lib
 export GST_DEBUG=2
 
