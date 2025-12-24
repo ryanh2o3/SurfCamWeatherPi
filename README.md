@@ -1,4 +1,4 @@
-# SurfCam Weather Pi
+# SurfCam Weather Pi - still a work in progress
 
 A Raspberry Pi app that captures surf conditions and streams live video. It takes photos every 30 seconds and can stream live video when someone requests it.
 
