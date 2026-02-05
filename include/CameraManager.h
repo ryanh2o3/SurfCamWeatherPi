@@ -21,7 +21,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <queue>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <gst/gst.h>
@@ -53,6 +56,7 @@ public:
     bool startVideoMode(int width, int height, int fps);
     bool stopVideoMode();
     bool getEncodedFrame(FrameData& frameData);
+    bool reinitialize();
 
 private:
     // LibCamera members
@@ -83,7 +87,7 @@ private:
     // Initialize and manage GStreamer pipeline
     bool initializeGstreamerPipeline(int width, int height, int fps);
     void shutdownGstreamerPipeline();
-    static void onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
+    static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
     static void onNewEncodedBuffer(GstElement* sink, gpointer user_data);
     
     // Buffer management

@@ -71,56 +71,57 @@ void snapshotWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     }
 }
 
-void streamToKinesis(SurfCam::CameraManager& camera, 
+void streamToKinesis(SurfCam::CameraManager& camera,
                      const SurfCam::AwsCredentials& credentials) {
     try {
-        SurfCam::KinesisStreamer streamer(SurfCam::Config::KINESIS_STREAM_NAME, 
+        SurfCam::KinesisStreamer streamer(SurfCam::Config::KINESIS_STREAM_NAME,
                                          SurfCam::Config::AWS_REGION);
-                                         
+
         if (!streamer.initialize(credentials)) {
             std::cerr << "[" << getCurrentTimeString() << "] Failed to initialize KVS streamer" << std::endl;
             return;
         }
-        
-        // Start video capture with lower resolution for Pi Zero
-        if (!camera.startVideoMode(SurfCam::Config::CAMERA_WIDTH, 
-                                  SurfCam::Config::CAMERA_HEIGHT, 
-                                  SurfCam::Config::STREAM_FPS)) {
+
+        if (!camera.startVideoMode(SurfCam::Config::CAMERA_WIDTH,
+                                   SurfCam::Config::CAMERA_HEIGHT,
+                                   SurfCam::Config::STREAM_FPS)) {
             std::cerr << "[" << getCurrentTimeString() << "] Failed to start video mode" << std::endl;
             return;
         }
-        
+
         std::cout << "[" << getCurrentTimeString() << "] Stream started" << std::endl;
-        
+
         int frameCount = 0;
         int fragmentNumber = 0;
-        const int framesPerFragment = SurfCam::Config::STREAM_FPS; // 1 second fragments for Pi Zero
-        
-        long long streamStartTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        
-        std::vector<uint8_t> frameBuffer;
+        const int framesPerFragment = SurfCam::Config::STREAM_FPS; // 1-second fragments
+
         std::vector<uint8_t> fragmentBuffer;
         SurfCam::FrameData frameData;
+        bool fragmentHasKeyFrame = false;
 
-        
-        // Add watchdog timing
         auto lastSuccessTime = std::chrono::steady_clock::now();
-        
+        auto sessionStart = std::chrono::steady_clock::now();
+
         while (streamShouldRun.load() && keepRunning.load()) {
-            // Capture frame with timeout
+            // Exit before KVS credential expiry so streamCheckWorker can restart
+            // with fresh credentials (tokens are set to 180s in DefaultCallbackProvider)
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - sessionStart).count();
+            if (elapsed >= SurfCam::Config::CREDENTIAL_REFRESH_SECONDS) {
+                std::cout << "[" << getCurrentTimeString()
+                          << "] Credential refresh needed, cycling stream session" << std::endl;
+                break;
+            }
+
             if (!camera.getEncodedFrame(frameData)) {
-                std::cerr << "[" << getCurrentTimeString() << "] Failed to capture frame" << std::endl;
-                
-                // Check if we're stuck
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - lastSuccessTime).count() > 10) {
                     std::cerr << "[" << getCurrentTimeString() << "] Frame capture stalled, restarting camera" << std::endl;
                     camera.stopVideoMode();
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     if (!camera.startVideoMode(SurfCam::Config::CAMERA_WIDTH,
-                                             SurfCam::Config::CAMERA_HEIGHT,
-                                             SurfCam::Config::STREAM_FPS)) {
+                                               SurfCam::Config::CAMERA_HEIGHT,
+                                               SurfCam::Config::STREAM_FPS)) {
                         std::cerr << "[" << getCurrentTimeString() << "] Failed to restart camera" << std::endl;
                         return;
                     }
@@ -128,63 +129,58 @@ void streamToKinesis(SurfCam::CameraManager& camera,
                 }
                 continue;
             }
-            
+
             lastSuccessTime = std::chrono::steady_clock::now();
-            
-            // Check if buffer would exceed size limit before adding frame
+
+            if (frameData.keyFrame) {
+                fragmentHasKeyFrame = true;
+            }
+
+            // Flush fragment if it would exceed the size limit
             if (fragmentBuffer.size() + frameData.data.size() > SurfCam::Config::MAX_FRAGMENT_SIZE) {
-                // Send current fragment and reset buffer
-                long long fragmentTimecode = fragmentNumber * 1000; // 1 second in milliseconds
-                
-                if (streamer.sendFrameFragment(fragmentBuffer, fragmentTimecode)) {
-                    std::cout << "[" << getCurrentTimeString() << "] Sent fragment " 
-                              << fragmentNumber << " (size limit)" << std::endl;
-                } else {
+                long long fragmentTimecode = fragmentNumber * 1000;
+                if (!streamer.sendFrameFragment(fragmentBuffer, fragmentTimecode, fragmentHasKeyFrame)) {
                     std::cerr << "[" << getCurrentTimeString() << "] Failed to send fragment" << std::endl;
                 }
-                
                 fragmentBuffer.clear();
                 frameCount = 0;
                 fragmentNumber++;
+                fragmentHasKeyFrame = false;
             }
-            
-            // Add frame to fragment buffer
+
             fragmentBuffer.insert(fragmentBuffer.end(), frameData.data.begin(), frameData.data.end());
             frameCount++;
-            
-            // When we have enough frames for a fragment, send it to Kinesis
+
+            // Flush fragment after accumulating one second of frames
             if (frameCount >= framesPerFragment) {
-                // Calculate timestamp
-                long long fragmentTimecode = fragmentNumber * 1000; // 1 second in milliseconds
-                
-                if (streamer.sendFrameFragment(fragmentBuffer, fragmentTimecode)) {
-                    std::cout << "[" << getCurrentTimeString() << "] Sent fragment " 
-                              << fragmentNumber << " (frame count)" << std::endl;
-                } else {
+                long long fragmentTimecode = fragmentNumber * 1000;
+                if (!streamer.sendFrameFragment(fragmentBuffer, fragmentTimecode, fragmentHasKeyFrame)) {
                     std::cerr << "[" << getCurrentTimeString() << "] Failed to send fragment" << std::endl;
                 }
-                
                 fragmentBuffer.clear();
                 frameCount = 0;
                 fragmentNumber++;
+                fragmentHasKeyFrame = false;
             }
-            
-            // Sleep briefly to give other processes CPU time on Pi Zero
+
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        
-        // Clean up
+
+        // Flush remaining data
+        if (!fragmentBuffer.empty()) {
+            long long fragmentTimecode = fragmentNumber * 1000;
+            streamer.sendFrameFragment(fragmentBuffer, fragmentTimecode, fragmentHasKeyFrame);
+        }
+
         camera.stopVideoMode();
         streamer.shutdown();
         std::cout << "[" << getCurrentTimeString() << "] Stream stopped" << std::endl;
-        
+
     } catch (const std::exception& e) {
         std::cerr << "[" << getCurrentTimeString() << "] Error in streaming thread: " << e.what() << std::endl;
         camera.stopVideoMode();
     }
 }
-
-// In the streamCheckWorker function:
 
 void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     int failureCount = 0;
@@ -290,8 +286,6 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
 }
 
 
-// Add this function:
-
 void monitorSystemResources() {
     while (keepRunning) {
         // Check system memory using procfs
@@ -390,7 +384,7 @@ int main() {
     // Start worker threads
     std::thread snapshotThread(snapshotWorker, std::ref(camera), std::ref(apiClient));
     std::thread checkStreamThread(streamCheckWorker, std::ref(camera), std::ref(apiClient));
-    std::thread monitorThread(monitorSystemResources); // Add this line
+    std::thread monitorThread(monitorSystemResources);
 
     // Keep main thread alive
     while (keepRunning) {
@@ -400,7 +394,7 @@ int main() {
     // Clean up
     snapshotThread.join();
     checkStreamThread.join();
-    monitorThread.join(); // Add this line
+    monitorThread.join();
 
     if (streamThread && streamThread->joinable()) {
         streamThread->join();

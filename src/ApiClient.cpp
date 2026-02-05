@@ -20,6 +20,8 @@
 #include "Config.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <curl/curl.h>
 #include <chrono>
 
@@ -222,9 +224,8 @@ bool ApiClient::isStreamingRequested(const std::string& spotId) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Exception checking streaming status: " << e.what() << std::endl;
-        curl_easy_cleanup(curl);
     }
-    
+
     if (headers) curl_slist_free_all(headers);
     if (curl) curl_easy_cleanup(curl);
 

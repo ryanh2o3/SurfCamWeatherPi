@@ -19,6 +19,7 @@
 #pragma once
 
 #include <string>
+#include <mutex>
 #include <optional>
 #include <nlohmann/json.hpp>
 

@@ -16,10 +16,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Set environment variables
-export API_KEY="your_api_key_here"
-export SPOT_ID="your_spot_id_here"
-export LD_LIBRARY_PATH=/usr/local/lib
+# Environment variables: API_KEY, SPOT_ID, and LD_LIBRARY_PATH are set via
+# systemd Environment= directives in surfcam.service.
+# If running this script manually, export them before running.
 export GST_DEBUG=2
 
 # Kill any existing instances
@@ -37,6 +36,6 @@ while ! ls /dev/video* &> /dev/null; do
     sleep 5
 done
 
-# Start the application with log redirection
+# Start the application (exec replaces shell so systemd tracks the real PID)
 cd /home/ryanpatton
-/usr/local/bin/surfcam > /home/ryanpatton/surfcam.log 2>&1
+exec /usr/local/bin/surfcam

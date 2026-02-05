@@ -415,36 +415,6 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
 }
 
 
-// Static callback for GStreamer bus messages
-gboolean CameraManager::onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data) {
-    CameraManager* manager = static_cast<CameraManager*>(user_data);
-    
-    switch (GST_MESSAGE_TYPE(msg)) {
-        case GST_MESSAGE_ERROR: {
-            GError* err = nullptr;
-            gchar* debug_info = nullptr;
-            gst_message_parse_error(msg, &err, &debug_info);
-            
-            std::cerr << "GStreamer error: " << err->message << std::endl;
-            if (debug_info) {
-                std::cerr << "Debug info: " << debug_info << std::endl;
-            }
-            
-            g_clear_error(&err);
-            g_free(debug_info);
-            break;
-        }
-        case GST_MESSAGE_EOS:
-            std::cout << "End of stream reached" << std::endl;
-            break;
-        default:
-            break;
-    }
-    
-    return TRUE;
-}
-
-
 void CameraManager::onNewEncodedBuffer(GstElement* sink, gpointer user_data) {
     CameraManager* manager = static_cast<CameraManager*>(user_data);
     GstSample* sample = nullptr;

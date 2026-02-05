@@ -26,6 +26,7 @@
 #include <DefaultCallbackProvider.h>
 
 #include "ApiClient.h" // For AwsCredentials
+#include "Config.h"
 
 namespace SurfCam {
 
@@ -35,14 +36,12 @@ public:
     ~KinesisStreamer();
 
     bool initialize(const AwsCredentials& credentials);
-    bool sendFrameFragment(const std::vector<uint8_t>& frameData, 
-                           long long timestamp);
+    bool sendFrameFragment(const std::vector<uint8_t>& frameData,
+                           long long timestamp, bool isKeyFrame);
     void shutdown();
     size_t getMaxRecommendedFragmentSize() const {
-    // Limit fragment size based on bandwidth and memory constraints
-    // Return a reasonable size limit (e.g., 1MB)
-    return 1024 * 1024; // 1MB
-}
+        return Config::MAX_FRAGMENT_SIZE;
+    }
 
 private:
     std::string streamName_;

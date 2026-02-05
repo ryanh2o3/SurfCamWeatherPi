@@ -1,0 +1,19 @@
+[Unit]
+Description=SurfCam Weather Pi — surf spot webcam streamer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ryanpatton/script.sh
+Restart=always
+RestartSec=10
+User=ryanpatton
+
+# Credentials and runtime paths — fill in API_KEY and SPOT_ID before enabling
+Environment="API_KEY=your_api_key_here"
+Environment="SPOT_ID=your_spot_id_here"
+Environment="LD_LIBRARY_PATH=/usr/local/lib"
+
+[Install]
+WantedBy=multi-user.target

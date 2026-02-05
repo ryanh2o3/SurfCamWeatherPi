@@ -1,3 +1,8 @@
+# Cross-compilation for Pi Zero:
+#   cmake -B build-pi -DCMAKE_TOOLCHAIN_FILE=toolchain-pi-zero.cmake -DPI_SYSROOT=$HOME/pi-sysroot .
+#   cmake --build build-pi -j$(nproc)
+#   scp build-pi/surfcam pi@<pi-ip>:/usr/local/bin/
+
 cmake_minimum_required(VERSION 3.10)
 project(SurfCamWeatherPi VERSION 1.0)
 

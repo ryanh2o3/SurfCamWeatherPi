@@ -112,7 +112,7 @@ bool KinesisStreamer::initialize(const AwsCredentials& credentials) {
     }
 }
 
-bool KinesisStreamer::sendFrameFragment(const std::vector<uint8_t>& frameData, long long timestamp) {
+bool KinesisStreamer::sendFrameFragment(const std::vector<uint8_t>& frameData, long long timestamp, bool isKeyFrame) {
     if (!isInitialized_ || !videoStream_) {
         std::cerr << "KinesisStreamer not initialized" << std::endl;
         return false;
@@ -135,7 +135,7 @@ bool KinesisStreamer::sendFrameFragment(const std::vector<uint8_t>& frameData, l
         frame.duration = 0;
         frame.decodingTs = currentTimestamp_; 
         frame.presentationTs = currentTimestamp_;
-        frame.flags = FRAME_FLAG_KEY_FRAME;
+        frame.flags = isKeyFrame ? FRAME_FLAG_KEY_FRAME : 0;
 
         const int MAX_RETRIES = 3;
         int retryCount = 0;
