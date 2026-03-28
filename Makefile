@@ -1,5 +1,6 @@
 # SurfCamWeatherPi — convenience targets around CMake, ctest, and Docker.
-# Requires a native toolchain with libcamera + GStreamer unless you use docker-* targets.
+# Full surfcam needs libcamera + GStreamer (typical on Pi/Debian). On macOS, use
+#   make test / make build-test   (tests only)   or   make docker   (full stack).
 
 BUILD_DIR      ?= build
 CMAKE_FLAGS    ?= -DCMAKE_BUILD_TYPE=Release
@@ -15,8 +16,8 @@ DOCKERFILE     ?= Dockerfile.build
 help:
 	@echo "SurfCamWeatherPi Makefile"
 	@echo ""
-	@echo "  make / make surfcam   Configure (no test targets) and build surfcam only"
-	@echo "  make build-test       Configure with BUILD_TESTING=ON and build surfcam + tests"
+	@echo "  make / make surfcam   Build surfcam (fails on macOS without camera deps — use docker)"
+	@echo "  make build-test       BUILD_TESTING=ON: tests always; surfcam too if libcamera+GStreamer exist"
 	@echo "  make test / check  Unit tests (ctest) + HTTP integration (mock + surfcam_test_http)"
 	@echo "  make unit-test     ctest only"
 	@echo "  make http-test     Mock API + surfcam_test_http only"

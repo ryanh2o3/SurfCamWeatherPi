@@ -17,8 +17,12 @@ fi
 python3 "$ROOT/scripts/mock_api_server.py" "$PORT" &
 MOCK_PID=$!
 
+LOG=""
 cleanup() {
   kill "$MOCK_PID" 2>/dev/null || true
+  if [[ -n "${LOG}" ]]; then
+    rm -f "${LOG}"
+  fi
 }
 trap cleanup EXIT
 
@@ -32,4 +36,13 @@ done
 export SURFCAM_TEST_API_BASE="http://127.0.0.1:${PORT}"
 export API_KEY="${API_KEY:-test-api-key}"
 
-"$HTTP_BIN"
+# ApiClient logs expected failures (bad JSON, timeouts, 500s) to stderr; keep success output calm.
+LOG=$(mktemp)
+
+if [[ -n "${SURFCAM_HTTP_TEST_VERBOSE:-}" ]]; then
+  "$HTTP_BIN"
+elif ! "$HTTP_BIN" 2>"$LOG"; then
+  echo "surfcam_test_http failed; captured stderr:" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
