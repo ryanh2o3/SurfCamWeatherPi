@@ -95,17 +95,23 @@ std::string getCurrentTimeString() {
 }
 
 void snapshotWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
-    while (keepRunning) {
-        std::cout << "[" << getCurrentTimeString() << "] Taking snapshot..." << std::endl;
+    while (keepRunning.load(std::memory_order_acquire)) {
+        try {
+            std::cout << "[" << getCurrentTimeString() << "] Taking snapshot..." << std::endl;
 
-        if (camera.takePicture(SurfCam::Config::SNAPSHOT_PATH)) {
-            if (api.uploadSnapshot(SurfCam::Config::SNAPSHOT_PATH, SurfCam::Config::SPOT_ID)) {
-                std::cout << "[" << getCurrentTimeString() << "] Snapshot uploaded successfully!" << std::endl;
+            if (camera.takePicture(SurfCam::Config::SNAPSHOT_PATH)) {
+                if (api.uploadSnapshot(SurfCam::Config::SNAPSHOT_PATH, SurfCam::Config::SPOT_ID)) {
+                    std::cout << "[" << getCurrentTimeString() << "] Snapshot uploaded successfully!" << std::endl;
+                } else {
+                    std::cout << "[" << getCurrentTimeString() << "] Failed to upload snapshot." << std::endl;
+                }
             } else {
-                std::cout << "[" << getCurrentTimeString() << "] Failed to upload snapshot." << std::endl;
+                std::cout << "[" << getCurrentTimeString() << "] Failed to capture snapshot." << std::endl;
             }
-        } else {
-            std::cout << "[" << getCurrentTimeString() << "] Failed to capture snapshot." << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[" << getCurrentTimeString() << "] Snapshot worker exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[" << getCurrentTimeString() << "] Snapshot worker: unknown exception" << std::endl;
         }
 
         std::this_thread::sleep_for(SurfCam::Config::SNAPSHOT_INTERVAL);
@@ -170,6 +176,9 @@ void streamHlsWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
 
 void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     int apiFailureStreak = 0;
+    /// Last definitive stream intent from the API (200 + boolean). On network/API failure we keep this so HLS
+    /// does not drop after STREAM_TIMEOUT when the server is unreachable.
+    bool lastDefinitiveStreamOn = false;
 
     while (keepRunning.load(std::memory_order_acquire)) {
         reapFinishedHlsWorker();
@@ -206,6 +215,7 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
 
             if (streamState.has_value()) {
                 apiFailureStreak = 0;
+                lastDefinitiveStreamOn = *streamState;
                 if (*streamState) {
                     lastStreamRequestTime.store(nowSeconds, std::memory_order_release);
                 }
@@ -218,7 +228,11 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
             const bool withinGrace =
                 lastReqSec != 0 &&
                 (nowSeconds - lastReqSec) < SurfCam::Config::STREAM_TIMEOUT.count();
-            const bool shouldStream = apiSaysStreamOn || withinGrace;
+            // Definitive true → on. Definitive false → off unless still within post-true grace. API unreachable →
+            // keep last definitive intent so internet outages do not stop an active encode after a few seconds.
+            const bool shouldStream = apiSaysStreamOn ||
+                                      (streamState.has_value() && !*streamState && withinGrace) ||
+                                      (!streamState.has_value() && lastDefinitiveStreamOn);
 
             if (keepRunning.load(std::memory_order_acquire)) {
                 if (shouldStream && (!streamThread || !streamThread->joinable())) {
@@ -234,6 +248,9 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
         } catch (const std::exception& e) {
             std::cerr << "[" << getCurrentTimeString() << "] Exception in stream check (API): " << e.what()
                       << std::endl;
+            apiFailureStreak++;
+        } catch (...) {
+            std::cerr << "[" << getCurrentTimeString() << "] Exception in stream check (API): unknown" << std::endl;
             apiFailureStreak++;
         }
 
@@ -296,6 +313,7 @@ void monitorSystemResources() {
             }
         }
 
+        try {
         if (memOk && tempOk) {
             const float cpuTemp = tempMilliC / 1000.0f;
             std::cout << "[" << getCurrentTimeString() << "] System monitor: "
@@ -334,6 +352,11 @@ void monitorSystemResources() {
                 lastProcWarn = now;
             }
         }
+        } catch (const std::exception& e) {
+            std::cerr << "[" << getCurrentTimeString() << "] System monitor exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[" << getCurrentTimeString() << "] System monitor: unknown exception" << std::endl;
+        }
 
         std::this_thread::sleep_for(std::chrono::seconds(30));
     }
@@ -358,10 +381,20 @@ int main() {
               << SurfCam::Config::HLS_PRESIGN_PATH << std::endl;
 
     SurfCam::CameraManager camera;
-    if (!camera.initialize()) {
-        std::cerr << "Failed to initialize camera" << std::endl;
-        curl_global_cleanup();
-        return 1;
+    {
+        using namespace std::chrono_literals;
+        auto retryDelay = 2s;
+        constexpr auto kRetryDelayMax = 60s;
+        while (keepRunning.load(std::memory_order_acquire) && !camera.initialize()) {
+            std::cerr << "[" << getCurrentTimeString() << "] Camera init failed (common after power loss); retrying in "
+                      << std::chrono::duration_cast<std::chrono::seconds>(retryDelay).count() << "s..." << std::endl;
+            std::this_thread::sleep_for(retryDelay);
+            retryDelay = std::min(retryDelay * 2, kRetryDelayMax);
+        }
+        if (!keepRunning.load(std::memory_order_acquire)) {
+            curl_global_cleanup();
+            return 0;
+        }
     }
 
     SurfCam::ApiClient apiClient(SurfCam::Config::API_ENDPOINT, SurfCam::Config::API_KEY);

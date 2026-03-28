@@ -778,6 +778,9 @@ void CameraManager::requestComplete(libcamera::Request* request) {
         }
 #else
         auto planes = buffer->planes();
+        if (planes.empty()) {
+            continue;
+        }
         auto span = planes[0].map();
 
         if (span) {

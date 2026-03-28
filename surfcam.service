@@ -8,6 +8,10 @@ Type=simple
 ExecStart=/home/ryanpatton/script.sh
 Restart=always
 RestartSec=10
+# After power loss, allow unlimited restart attempts (default burst limit can stop the service).
+StartLimitIntervalSec=0
+# HLS drain + thread joins can exceed the default 90s stop timeout on slow storage.
+TimeoutStopSec=180
 User=ryanpatton
 
 # Credentials and runtime paths — fill in API_KEY and SPOT_ID before enabling
