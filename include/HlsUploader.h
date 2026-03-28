@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <filesystem>
 #include <list>
 #include <optional>
@@ -27,7 +26,7 @@
 
 namespace SurfCam {
 
-class ApiClient;
+struct IHlsPresignClient;
 
 /// Watches the local HLS directory and uploads new .ts segments and the playlist via presigned PUT.
 class HlsUploader {
@@ -35,11 +34,9 @@ public:
     void resetSession();
 
     /// Upload any new stable segments, then the playlist if it changed. Returns false if dir missing.
-    bool pollAndUpload(ApiClient& api, const std::string& spotId, const std::string& dirPath);
+    bool pollAndUpload(IHlsPresignClient& api, const std::string& spotId, const std::string& dirPath);
 
 private:
-    static constexpr std::size_t kMaxUploadedSegmentNames = 512;
-
     void onSegmentUploaded(const std::string& segmentFilename);
     [[nodiscard]] bool allPlaylistSegmentsUploaded(const std::filesystem::path& playlistPath) const;
 

@@ -3,11 +3,13 @@
 #   cmake --build build-pi -j$(nproc)
 #   scp build-pi/surfcam pi@<pi-ip>:/usr/local/bin/
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 project(SurfCamWeatherPi VERSION 1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 option(ENABLE_TSAN "Build with ThreadSanitizer (-fsanitize=thread)" OFF)
+option(BUILD_TESTING "Build unit tests, HTTP smoke binary, and register ctest targets" OFF)
+include(CTest)
 if(ENABLE_TSAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1 -g -fsanitize=thread -fno-omit-frame-pointer")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
@@ -59,6 +61,7 @@ add_executable(surfcam
     src/CameraManager.cpp
     src/ApiClient.cpp
     src/HlsUploader.cpp
+    src/HlsUploadPolicy.cpp
     src/Config.cpp
 )
 
@@ -76,3 +79,30 @@ target_compile_definitions(surfcam PRIVATE
 
 # Install target
 install(TARGETS surfcam DESTINATION /usr/local/bin)
+
+if(BUILD_TESTING AND NOT ENABLE_TSAN)
+    include(FetchContent)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.5.3
+    )
+    FetchContent_MakeAvailable(Catch2)
+
+    add_executable(surfcam_unit_tests
+        tests/hls_tests.cpp
+        src/HlsUploader.cpp
+        src/HlsUploadPolicy.cpp
+    )
+    target_link_libraries(surfcam_unit_tests PRIVATE Catch2::Catch2WithMain)
+
+    add_executable(surfcam_test_http
+        tests/http_smoke.cpp
+        src/ApiClient.cpp
+        src/Config.cpp
+    )
+    target_link_libraries(surfcam_test_http PRIVATE ${CURL_LIBRARIES} pthread)
+    target_include_directories(surfcam_test_http PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CURL_INCLUDE_DIRS})
+
+    add_test(NAME surfcam_unit_tests COMMAND surfcam_unit_tests)
+endif()

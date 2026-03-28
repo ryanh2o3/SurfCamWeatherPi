@@ -8,9 +8,21 @@ on:
 
 jobs:
   docker-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release-and-tests
+            enable_tsan: "OFF"
+          - name: tsan-compile
+            enable_tsan: "ON"
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build surfcam (Debian Bookworm–style image)
-        run: docker build -f Dockerfile.build -t surfcam-ci .
+      - name: Docker build (Debian Bookworm toolchain)
+        run: |
+          docker build -f Dockerfile.build \
+            --build-arg ENABLE_TSAN=${{ matrix.enable_tsan }} \
+            -t surfcam-ci-${{ matrix.name }} .

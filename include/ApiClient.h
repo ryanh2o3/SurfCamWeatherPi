@@ -18,16 +18,18 @@
 
 #pragma once
 
+#include "IHlsPresignClient.h"
+
 #include <optional>
 #include <string>
 
 namespace SurfCam {
 
 /// HTTP client; libcurl is initialized once in main (R8).
-class ApiClient {
+class ApiClient : public IHlsPresignClient {
 public:
     explicit ApiClient(std::string apiEndpoint, std::string apiKey);
-    ~ApiClient() = default;
+    ~ApiClient() override = default;
 
     bool uploadSnapshot(const std::string& imagePath, const std::string& spotId);
     /// `true` / `false` when the API returns a definitive 200 + boolean; empty on network/HTTP/parse errors.
@@ -35,7 +37,7 @@ public:
 
     /// POST /hls/presign then PUT file bytes to the returned URL (S3 presigned PUT).
     bool uploadLocalFileWithPresign(const std::string& objectKey, const std::string& contentType,
-                                    const std::string& filePath);
+                                    const std::string& filePath) override;
 
 private:
     std::string apiEndpoint_;

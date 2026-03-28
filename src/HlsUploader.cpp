@@ -17,9 +17,11 @@
  */
 
 #include "HlsUploader.h"
-#include "ApiClient.h"
 #include "Config.h"
+#include "HlsUploadPolicy.h"
+#include "IHlsPresignClient.h"
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -28,12 +30,6 @@
 namespace SurfCam {
 
 namespace {
-
-void trimTrailingCarriageReturn(std::string& line) {
-    if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-    }
-}
 
 bool fileSizeStable(const std::filesystem::path& p) {
     std::error_code ec;
@@ -51,10 +47,6 @@ bool fileSizeStable(const std::filesystem::path& p) {
     return !ec && c == b;
 }
 
-std::string s3KeyForFile(const std::string& spotId, const std::string& filename) {
-    return "spots/" + spotId + "/live/" + filename;
-}
-
 }  // namespace
 
 void HlsUploader::resetSession() {
@@ -64,16 +56,7 @@ void HlsUploader::resetSession() {
 }
 
 void HlsUploader::onSegmentUploaded(const std::string& segmentFilename) {
-    if (uploadedSegments_.count(segmentFilename) != 0) {
-        return;
-    }
-    while (uploadedSegmentOrder_.size() >= kMaxUploadedSegmentNames) {
-        const std::string& oldest = uploadedSegmentOrder_.front();
-        uploadedSegments_.erase(oldest);
-        uploadedSegmentOrder_.pop_front();
-    }
-    uploadedSegmentOrder_.push_back(segmentFilename);
-    uploadedSegments_.insert(segmentFilename);
+    HlsUploadPolicy::recordSegmentUploaded(segmentFilename, uploadedSegments_, uploadedSegmentOrder_);
 }
 
 bool HlsUploader::allPlaylistSegmentsUploaded(const std::filesystem::path& playlistPath) const {
@@ -81,23 +64,10 @@ bool HlsUploader::allPlaylistSegmentsUploaded(const std::filesystem::path& playl
     if (!in) {
         return false;
     }
-    std::string line;
-    while (std::getline(in, line)) {
-        trimTrailingCarriageReturn(line);
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-        if (line.size() < 4 || line.compare(line.size() - 3, 3, ".ts") != 0) {
-            continue;
-        }
-        if (uploadedSegments_.count(line) == 0) {
-            return false;
-        }
-    }
-    return true;
+    return HlsUploadPolicy::playlistAllTsLinesUploaded(in, uploadedSegments_);
 }
 
-bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const std::string& dirPath) {
+bool HlsUploader::pollAndUpload(IHlsPresignClient& api, const std::string& spotId, const std::string& dirPath) {
     namespace fs = std::filesystem;
     std::error_code ec;
     if (!fs::is_directory(dirPath, ec)) {
@@ -123,7 +93,7 @@ bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const
         if (!fileSizeStable(p)) {
             continue;
         }
-        const std::string key = s3KeyForFile(spotId, name);
+        const std::string key = HlsUploadPolicy::s3KeyForFile(spotId, name);
         if (api.uploadLocalFileWithPresign(key, "video/mp2t", p.string())) {
             onSegmentUploaded(name);
         }
@@ -149,7 +119,7 @@ bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const
         return true;
     }
 
-    const std::string pk = s3KeyForFile(spotId, Config::HLS_PLAYLIST_NAME);
+    const std::string pk = HlsUploadPolicy::s3KeyForFile(spotId, Config::HLS_PLAYLIST_NAME);
     if (api.uploadLocalFileWithPresign(pk, "application/vnd.apple.mpegurl", playlist.string())) {
         lastPlaylistWrite_ = mtime;
     }
