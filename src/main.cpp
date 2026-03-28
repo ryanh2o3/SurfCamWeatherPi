@@ -20,6 +20,7 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <curl/curl.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -33,21 +34,40 @@
 #include "Config.h"
 #include "HlsUploader.h"
 
+// Stream thread ownership (Phase 0 / R1 — strategy A): only streamCheckWorker and main (after
+// checkStreamThread joins) call join/reset on streamThread. The monitor sets emergencyStopHls;
+// streamCheckWorker performs stop/join/reset on the next loop iteration.
+
 std::atomic<bool> keepRunning{true};
 std::atomic<bool> streamShouldRun{false};
 std::unique_ptr<std::thread> streamThread;
 std::atomic<long> lastStreamRequestTime{0};
+std::atomic<bool> emergencyStopHls{false};
+
+namespace {
+
+void stopHlsStreamSession() {
+    streamShouldRun.store(false);
+    if (streamThread && streamThread->joinable()) {
+        streamThread->join();
+        streamThread.reset();
+    }
+}
+
+}  // namespace
 
 void signalHandler(int /*signum*/) {
-    std::cout << "\nShutting down gracefully..." << std::endl;
-    keepRunning = false;
+    keepRunning.store(false);
 }
 
 std::string getCurrentTimeString() {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
+    const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    struct tm tmBuf {};
+    struct tm* tmPtr = localtime_r(&t, &tmBuf);
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
+    if (tmPtr) {
+        ss << std::put_time(tmPtr, "%Y-%m-%d %H:%M:%S");
+    }
     return ss.str();
 }
 
@@ -55,8 +75,8 @@ void snapshotWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     while (keepRunning) {
         std::cout << "[" << getCurrentTimeString() << "] Taking snapshot..." << std::endl;
 
-        if (camera.takePicture(SurfCam::Config::IMAGE_PATH)) {
-            if (api.uploadSnapshot(SurfCam::Config::IMAGE_PATH, SurfCam::Config::SPOT_ID)) {
+        if (camera.takePicture(SurfCam::Config::SNAPSHOT_PATH)) {
+            if (api.uploadSnapshot(SurfCam::Config::SNAPSHOT_PATH, SurfCam::Config::SPOT_ID)) {
                 std::cout << "[" << getCurrentTimeString() << "] Snapshot uploaded successfully!" << std::endl;
             } else {
                 std::cout << "[" << getCurrentTimeString() << "] Failed to upload snapshot." << std::endl;
@@ -110,7 +130,14 @@ void streamHlsWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
 void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     int failureCount = 0;
 
-    while (keepRunning) {
+    while (keepRunning.load(std::memory_order_acquire)) {
+        if (emergencyStopHls.exchange(false, std::memory_order_acq_rel)) {
+            std::cerr << "[" << getCurrentTimeString()
+                      << "] Emergency HLS stop requested (monitor); stopping session..." << std::endl;
+            stopHlsStreamSession();
+            failureCount = 0;
+        }
+
         try {
             bool streamRequested = api.isStreamingRequested(SurfCam::Config::SPOT_ID);
 
@@ -119,13 +146,14 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
                 std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
             if (streamRequested) {
-                lastStreamRequestTime.store(nowSeconds);
+                lastStreamRequestTime.store(nowSeconds, std::memory_order_release);
                 failureCount = 0;
             }
 
             bool shouldStream =
                 streamRequested ||
-                (nowSeconds - lastStreamRequestTime.load() < SurfCam::Config::STREAM_TIMEOUT.count());
+                (nowSeconds - lastStreamRequestTime.load(std::memory_order_acquire) <
+                 SurfCam::Config::STREAM_TIMEOUT.count());
 
             if (shouldStream && (!streamThread || !streamThread->joinable())) {
                 std::cout << "[" << getCurrentTimeString() << "] Starting HLS upload session..." << std::endl;
@@ -134,9 +162,7 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
                 failureCount = 0;
             } else if (!shouldStream && streamThread && streamThread->joinable()) {
                 std::cout << "[" << getCurrentTimeString() << "] Stopping HLS session..." << std::endl;
-                streamShouldRun.store(false);
-                streamThread->join();
-                streamThread.reset();
+                stopHlsStreamSession();
                 failureCount = 0;
             }
 
@@ -148,11 +174,7 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
         if (failureCount > 3) {
             std::cerr << "[" << getCurrentTimeString() << "] Multiple failures, attempting recovery" << std::endl;
 
-            if (streamThread && streamThread->joinable()) {
-                streamShouldRun.store(false);
-                streamThread->join();
-                streamThread.reset();
-            }
+            stopHlsStreamSession();
 
             if (!camera.reinitialize()) {
                 std::cerr << "[" << getCurrentTimeString() << "] Camera reinitialization failed" << std::endl;
@@ -167,61 +189,92 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
 }
 
 void monitorSystemResources() {
-    while (keepRunning) {
-        std::ifstream meminfo("/proc/meminfo");
-        std::string line;
+    using clock = std::chrono::steady_clock;
+    constexpr auto kWarnInterval = std::chrono::minutes(2);
+    auto lastProcWarn = clock::time_point::min();
+    auto lastLowMemWarn = clock::time_point::min();
+    auto lastHighTempWarn = clock::time_point::min();
+
+    while (keepRunning.load(std::memory_order_acquire)) {
+        const auto now = clock::now();
+        bool memOk = false;
         int totalMem = 0;
         int freeMem = 0;
         int buffers = 0;
         int cached = 0;
 
-        while (std::getline(meminfo, line)) {
-            if (line.find("MemTotal:") != std::string::npos) {
-                sscanf(line.c_str(), "MemTotal: %d", &totalMem);
-            } else if (line.find("MemFree:") != std::string::npos) {
-                sscanf(line.c_str(), "MemFree: %d", &freeMem);
-            } else if (line.find("Buffers:") != std::string::npos) {
-                sscanf(line.c_str(), "Buffers: %d", &buffers);
-            } else if (line.find("Cached:") != std::string::npos &&
-                       line.find("SwapCached:") == std::string::npos) {
-                sscanf(line.c_str(), "Cached: %d", &cached);
+        {
+            std::ifstream meminfo("/proc/meminfo");
+            if (meminfo) {
+                memOk = true;
+                std::string line;
+                while (std::getline(meminfo, line)) {
+                    if (line.find("MemTotal:") != std::string::npos) {
+                        sscanf(line.c_str(), "MemTotal: %d", &totalMem);
+                    } else if (line.find("MemFree:") != std::string::npos) {
+                        sscanf(line.c_str(), "MemFree: %d", &freeMem);
+                    } else if (line.find("Buffers:") != std::string::npos) {
+                        sscanf(line.c_str(), "Buffers: %d", &buffers);
+                    } else if (line.find("Cached:") != std::string::npos &&
+                               line.find("SwapCached:") == std::string::npos) {
+                        sscanf(line.c_str(), "Cached: %d", &cached);
+                    }
+                }
             }
         }
 
-        int availableMem = (freeMem + buffers + cached) / 1024;
-        int totalMemMB = totalMem / 1024;
+        int availableMemMb = 0;
+        int totalMemMb = 0;
+        if (memOk && totalMem > 0) {
+            availableMemMb = (freeMem + buffers + cached) / 1024;
+            totalMemMb = totalMem / 1024;
+        }
 
-        std::ifstream tempFile("/sys/class/thermal/thermal_zone0/temp");
-        int temp = 0;
-        if (tempFile >> temp) {
-            float cpuTemp = temp / 1000.0f;
+        bool tempOk = false;
+        int tempMilliC = 0;
+        {
+            std::ifstream tempFile("/sys/class/thermal/thermal_zone0/temp");
+            if (tempFile >> tempMilliC) {
+                tempOk = true;
+            }
+        }
 
+        if (memOk && tempOk) {
+            const float cpuTemp = tempMilliC / 1000.0f;
             std::cout << "[" << getCurrentTimeString() << "] System monitor: "
-                      << "Memory: " << availableMem << "/" << totalMemMB << " MB free, "
+                      << "Memory: " << availableMemMb << "/" << totalMemMb << " MB free, "
                       << "CPU temp: " << cpuTemp << "°C" << std::endl;
 
-            if (availableMem < 40) {
-                std::cerr << "[" << getCurrentTimeString() << "] LOW MEMORY WARNING: " << availableMem << " MB"
-                          << std::endl;
-                if (streamThread && streamThread->joinable()) {
-                    std::cout << "[" << getCurrentTimeString() << "] Emergency HLS shutdown (low memory)"
-                              << std::endl;
-                    streamShouldRun.store(false);
-                    streamThread->join();
-                    streamThread.reset();
+            if (availableMemMb < 40) {
+                emergencyStopHls.store(true, std::memory_order_release);
+                if (now - lastLowMemWarn > kWarnInterval) {
+                    std::cerr << "[" << getCurrentTimeString() << "] LOW MEMORY WARNING: " << availableMemMb
+                              << " MB (HLS stop requested)" << std::endl;
+                    lastLowMemWarn = now;
                 }
             }
 
             if (cpuTemp > 75.0f) {
-                std::cerr << "[" << getCurrentTimeString() << "] HIGH TEMPERATURE WARNING: " << cpuTemp << "°C"
-                          << std::endl;
-                if (streamThread && streamThread->joinable()) {
-                    std::cout << "[" << getCurrentTimeString() << "] Emergency HLS shutdown (temperature)"
-                              << std::endl;
-                    streamShouldRun.store(false);
-                    streamThread->join();
-                    streamThread.reset();
+                emergencyStopHls.store(true, std::memory_order_release);
+                if (now - lastHighTempWarn > kWarnInterval) {
+                    std::cerr << "[" << getCurrentTimeString() << "] HIGH TEMPERATURE WARNING: " << cpuTemp
+                              << "°C (HLS stop requested)" << std::endl;
+                    lastHighTempWarn = now;
                 }
+            }
+        } else {
+            if (now - lastProcWarn > kWarnInterval) {
+                if (!memOk) {
+                    std::cerr << "[" << getCurrentTimeString()
+                              << "] System monitor: cannot read /proc/meminfo; skipping memory metrics this cycle"
+                              << std::endl;
+                }
+                if (!tempOk) {
+                    std::cerr << "[" << getCurrentTimeString()
+                              << "] System monitor: cannot read thermal zone; skipping temperature metrics this cycle"
+                              << std::endl;
+                }
+                lastProcWarn = now;
             }
         }
 
@@ -233,6 +286,15 @@ int main() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
+    if (!SurfCam::Config::loadFromEnvironment(std::cerr)) {
+        return 1;
+    }
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        std::cerr << "curl_global_init failed." << std::endl;
+        return 1;
+    }
+
     std::cout << "[" << getCurrentTimeString() << "] Starting SurfCam Weather Pi" << std::endl;
     std::cout << "[" << getCurrentTimeString() << "] Snapshots every " << SurfCam::Config::SNAPSHOT_INTERVAL.count()
               << " s; stream check every " << SurfCam::Config::STREAM_CHECK_INTERVAL.count() << " s" << std::endl;
@@ -242,6 +304,7 @@ int main() {
     SurfCam::CameraManager camera;
     if (!camera.initialize()) {
         std::cerr << "Failed to initialize camera" << std::endl;
+        curl_global_cleanup();
         return 1;
     }
 
@@ -251,19 +314,20 @@ int main() {
     std::thread checkStreamThread(streamCheckWorker, std::ref(camera), std::ref(apiClient));
     std::thread monitorThread(monitorSystemResources);
 
-    while (keepRunning) {
+    while (keepRunning.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+    std::cout << "\nShutting down gracefully..." << std::endl;
 
     streamShouldRun.store(false);
     snapshotThread.join();
     checkStreamThread.join();
     monitorThread.join();
 
-    if (streamThread && streamThread->joinable()) {
-        streamThread->join();
-    }
+    stopHlsStreamSession();
 
+    curl_global_cleanup();
     std::cout << "Exiting..." << std::endl;
     return 0;
 }

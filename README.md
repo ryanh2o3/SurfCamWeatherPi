@@ -34,17 +34,25 @@ Written in C++17. Here's what the main pieces do:
    - Uploads photos
    - Calls `POST /hls/presign` and **PUT**s segment/playlist bytes to S3
    - Checks if anyone wants to watch a stream
+   - Uses libcurl per request; **`curl_global_init` runs once in `main`** (not in the client ctor)
 
-3. **HlsUploader** (`src/HlsUploader.cpp`)
+3. **Config** (`include/Config.h`, `src/Config.cpp`)
+
+   - Compile-time defaults (intervals, camera size, HLS paths, etc.) live in `Config.h`
+   - **`API_KEY`**, **`SPOT_ID`**, and **`SNAPSHOT_PATH`** are read from the environment when the process starts
+
+4. **HlsUploader** (`src/HlsUploader.cpp`)
 
    - Watches the local HLS directory (`/tmp/surfcam-hls` by default)
-   - Uploads finished `.ts` segments first, then `index.m3u8`
+   - Uploads stable `.ts` segments first; uploads **`index.m3u8` only after** every segment file listed in the playlist has been uploaded successfully (avoids a playlist that points at missing objects)
+   - Tracks uploaded segment names with a bounded cache so memory does not grow forever
 
-4. **Main Application** (`src/main.cpp`)
+5. **Main Application** (`src/main.cpp`)
+
    - Keeps everything working together
    - Runs threads for taking photos and streaming
-   - Watches memory and temperature
-   - Shuts down cleanly when needed
+   - Watches memory and temperature (low memory / high temp **requests** an HLS stop on the stream thread; only the stream-check loop joins that worker—no `join` from the monitor)
+   - Shuts down cleanly when needed (async-signal-safe SIGINT/SIGTERM handler)
 
 ## What you need
 
@@ -111,22 +119,26 @@ sudo make install
 
 ## Configuration
 
-Settings are in `include/Config.h`. You can change:
+**Environment (required at startup)** — read in `main` via `Config::loadFromEnvironment()`. If `API_KEY` or `SPOT_ID` is missing, the program exits with an error (no `exit()` from static initializers).
 
-```cpp
-- SNAPSHOT_INTERVAL: How often to take photos (default: 30 seconds)
-- STREAM_CHECK_INTERVAL: How often to check if someone wants to stream (default: 5 seconds)
-- CAMERA_WIDTH/HEIGHT: Video size (default: 1280x720)
-- STREAM_FPS: Video frame rate (default: 15 fps)
-- API_ENDPOINT: Base URL for the API (snapshots + presign)
-- HLS_OUTPUT_DIR: Where GStreamer writes `index.m3u8` and segments (default: /tmp/surfcam-hls)
-- HLS_PRESIGN_PATH: Path appended to API_ENDPOINT for presigned PUTs (default: /hls/presign)
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `API_KEY` | Yes | API key sent as `Authorization: ApiKey …` |
+| `SPOT_ID` | Yes | Surf spot id (e.g. `Ireland_Donegal_Ballymastocker`) |
+| `SNAPSHOT_PATH` | No | Local JPEG path for each snapshot (default: `/tmp/surfcam-snapshot.jpg`) |
 
-### Environment Variables
+Set these in `script.sh`, systemd `Environment=`, or your shell before `surfcam`.
 
-- `API_KEY`: Your API key (set in `script.sh` or as an environment variable)
-- `SPOT_ID`: The identifier for your surf spot (e.g., "Ireland_Donegal_Ballymastocker")
+**Compile-time defaults** — edit `include/Config.h` (rebuild after changes):
+
+- `SNAPSHOT_INTERVAL`: Photo interval (default: 30 s)
+- `STREAM_CHECK_INTERVAL`: How often to poll streaming requests (default: 5 s)
+- `STREAM_TIMEOUT`: Keep streaming this long after the API last returned `stream_requested: true` (default: 30 s); enforced in `main`, not duplicated in the API client
+- `CAMERA_WIDTH` / `CAMERA_HEIGHT`: Video size (default: 1280×720)
+- `STREAM_FPS`: Video frame rate (default: 15)
+- `API_ENDPOINT`: Base URL for the API (snapshots + presign), e.g. `https://treblesurf.com/api`
+- `HLS_OUTPUT_DIR` / `HLS_PLAYLIST_NAME`: Where GStreamer writes HLS output (default under `/tmp/surfcam-hls`)
+- `HLS_PRESIGN_PATH`: Path appended to `API_ENDPOINT` for presigned PUTs (default: `/hls/presign`)
 
 ## Running it
 
@@ -196,7 +208,7 @@ It runs three threads that keep things going:
 
 When someone wants to watch:
 
-1. Polls the API (`check-streaming-requested`) and keeps going for `STREAM_TIMEOUT` after the last request
+1. Polls the API (`GET …/check-streaming-requested`) and keeps going for `STREAM_TIMEOUT` after the last time the API returned `stream_requested: true`
 2. Clears the local HLS directory and starts **libcamera → GStreamer** with **`hlssink`** (H.264 + MPEG-TS segments)
 3. **`HlsUploader`** uploads each closed `.ts` file, then an updated **`index.m3u8`**, using **`POST .../hls/presign`** + **HTTPS PUT** (see [AWS_HLS_OPTION_B.md](AWS_HLS_OPTION_B.md))
 4. Stops when requests end; your **CloudFront** (or public bucket URL) serves the playlist to browsers
@@ -205,8 +217,8 @@ When someone wants to watch:
 
 Since the Pi Zero is small, the app watches out for problems:
 
-- **Memory**: Checks every 30 seconds and stops streaming if memory gets too low
-- **Temperature**: Watches CPU temp and stops streaming if it gets too hot
+- **Memory**: Checks every 30 seconds; if free memory is critically low, it **signals** the stream-control thread to stop HLS (no direct `join` from the monitor). If `/proc/meminfo` cannot be read, that cycle’s metrics are skipped (not treated as zero).
+- **Temperature**: Same pattern for high CPU temp via `/sys/class/thermal/thermal_zone0/temp`; missing thermal file skips that cycle’s reading
 - **Recovery**: Tries to fix itself if the camera or network has issues
 - **HLS window**: `hlssink` keeps only a small number of local segment files (`HLS_PLAYLIST_MAX_FILES`)
 
@@ -249,13 +261,13 @@ journalctl -u surfcam.service -f
 ### Network problems
 
 ```bash
-# Test if you can reach the API
+# Test if you can reach the API (expect 401/405 without a real multipart body)
 curl -X POST https://treblesurf.com/api/upload-snapshot
 ```
 
 ### Streaming not working?
 
-- Implement **`POST /api/hls/presign`** on your backend and return a valid S3 presigned **PUT** URL (see [AWS_HLS_OPTION_B.md](AWS_HLS_OPTION_B.md))
+- Implement **`POST …/hls/presign`** (or your configured `HLS_PRESIGN_PATH`) on your backend and return a valid S3 presigned **PUT** URL (see [AWS_HLS_OPTION_B.md](AWS_HLS_OPTION_B.md))
 - Install **`gstreamer1.0-plugins-bad`** so `hlssink` / `hlssink2` exists (`gst-inspect-1.0 hlssink`)
 - Ensure the Pi can reach your API and S3 over HTTPS
 - Check if the Pi is overheating
@@ -271,18 +283,18 @@ Since the Pi Zero is pretty slow, the defaults lean conservative:
 
 ## API endpoints
 
-The app talks to these endpoints:
+Paths are relative to **`API_ENDPOINT`** (e.g. `https://treblesurf.com/api`). The code uses:
 
-- `POST /api/upload-snapshot`: Upload a photo
+- **`POST {API_ENDPOINT}/upload-snapshot`**: Upload a photo
 
   - Body: multipart/form-data with file, timestamp, spot_id
   - Headers: `Authorization: ApiKey <key>`
 
-- `GET /api/is-streaming-requested?spot_id=<id>`: Check if someone wants to stream
+- **`GET {API_ENDPOINT}/check-streaming-requested?spot_id=<id>`**: Check if someone wants to stream
 
-  - Returns JSON saying yes or no
+  - Returns JSON with boolean `stream_requested`
 
-- `POST /api/hls/presign`: Get a presigned S3 PUT URL for one HLS object
+- **`POST {API_ENDPOINT}{HLS_PRESIGN_PATH}`** (default `{API_ENDPOINT}/hls/presign`): Get a presigned S3 PUT URL for one HLS object
   - Body: JSON `{"key":"spots/<spot_id>/live/segment-00001.ts","content_type":"video/mp2t"}` (or `application/vnd.apple.mpegurl` for the playlist)
   - Response: JSON `{"url":"https://...","headers":{}}` — optional `headers` object must be sent on the PUT if your signer requires it
 

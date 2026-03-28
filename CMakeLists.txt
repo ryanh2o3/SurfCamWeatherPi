@@ -40,6 +40,7 @@ add_executable(surfcam
     src/CameraManager.cpp
     src/ApiClient.cpp
     src/HlsUploader.cpp
+    src/Config.cpp
 )
 
 target_link_libraries(surfcam

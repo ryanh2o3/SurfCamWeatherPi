@@ -19,16 +19,17 @@
 #pragma once
 
 #include <string>
-#include <mutex>
 
 namespace SurfCam {
 
+/// HTTP client; libcurl is initialized once in main (R8).
 class ApiClient {
 public:
-    ApiClient(const std::string& apiEndpoint, const std::string& apiKey);
-    ~ApiClient();
+    explicit ApiClient(std::string apiEndpoint, std::string apiKey);
+    ~ApiClient() = default;
 
     bool uploadSnapshot(const std::string& imagePath, const std::string& spotId);
+    /// True only when the API JSON says stream is requested (timeout/grace handled in main — R9).
     bool isStreamingRequested(const std::string& spotId);
 
     /// POST /hls/presign then PUT file bytes to the returned URL (S3 presigned PUT).
@@ -38,8 +39,6 @@ public:
 private:
     std::string apiEndpoint_;
     std::string apiKey_;
-    long lastStreamRequestTime_{0};
-    std::mutex apiMutex_;
 };
 
 }  // namespace SurfCam

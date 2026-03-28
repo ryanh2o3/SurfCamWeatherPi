@@ -31,6 +31,25 @@
 
 namespace SurfCam {
 
+namespace {
+
+/// Disconnects libcamera requestCompleted slot on scope exit (R4).
+class ScopedRequestCompletedConnection {
+public:
+    explicit ScopedRequestCompletedConnection(libcamera::Connection conn) : conn_(std::move(conn)) {}
+    ~ScopedRequestCompletedConnection() { conn_.disconnect(); }
+
+    ScopedRequestCompletedConnection(const ScopedRequestCompletedConnection&) = delete;
+    ScopedRequestCompletedConnection& operator=(const ScopedRequestCompletedConnection&) = delete;
+    ScopedRequestCompletedConnection(ScopedRequestCompletedConnection&&) = delete;
+    ScopedRequestCompletedConnection& operator=(ScopedRequestCompletedConnection&&) = delete;
+
+private:
+    libcamera::Connection conn_;
+};
+
+}  // namespace
+
 CameraManager::CameraManager() : isInitialized_(false), isVideoMode_(false) {
     gst_init(nullptr, nullptr);
 }
@@ -66,6 +85,7 @@ CameraManager::~CameraManager() {
 }
 
 bool CameraManager::initialize() {
+    std::lock_guard<std::mutex> lock(cameraOpsMutex_);
     try {
         cameraManager_ = std::make_unique<libcamera::CameraManager>();
         cameraManager_->start();
@@ -93,16 +113,23 @@ bool CameraManager::initialize() {
 }
 
 bool CameraManager::takePicture(const std::string& outputPath) {
+    std::unique_lock<std::mutex> cameraLock(cameraOpsMutex_);
     if (!isInitialized_ || !camera_) {
         std::cerr << "Camera not initialized" << std::endl;
         return false;
     }
 
-    try {
-        if (isVideoMode_) {
-            stopVideoMode();
+    if (isVideoMode_) {
+        cameraLock.unlock();
+        stopVideoMode();
+        cameraLock.lock();
+        if (!isInitialized_ || !camera_) {
+            std::cerr << "Camera not initialized" << std::endl;
+            return false;
         }
+    }
 
+    try {
         libcamera::StreamRoles roles = {libcamera::StreamRole::StillCapture};
         auto config = camera_->generateConfiguration(roles);
 
@@ -144,11 +171,11 @@ bool CameraManager::takePicture(const std::string& outputPath) {
         std::condition_variable completionCV;
         bool completed = false;
 
-        camera_->requestCompleted.connect([&](libcamera::Request* /*req*/) {
+        ScopedRequestCompletedConnection photoSlot(camera_->requestCompleted.connect([&](libcamera::Request* /*req*/) {
             std::lock_guard<std::mutex> lock(completionMutex);
             completed = true;
             completionCV.notify_one();
-        });
+        }));
 
         if (camera_->start() != 0) {
             std::cerr << "Failed to start camera" << std::endl;
@@ -238,6 +265,29 @@ void CameraManager::shutdownGstreamerPipeline() {
     hlssink_ = nullptr;
 }
 
+void CameraManager::rollbackFailedVideoStart() {
+    if (videoRequestCompletedConn_) {
+        videoRequestCompletedConn_->disconnect();
+        videoRequestCompletedConn_.reset();
+    }
+    if (camera_ && camera_->isRunning()) {
+        camera_->stop();
+    }
+    {
+        std::lock_guard<std::mutex> rq(requestMutex_);
+        pendingRequests_.clear();
+        completedRequests_.clear();
+    }
+    shutdownGstreamerPipeline();
+    {
+        std::lock_guard<std::mutex> lock(bufferMutex_);
+        allocator_.reset();
+        buffers_.clear();
+    }
+    captureActive_.store(false, std::memory_order_release);
+    shuttingDown_.store(false, std::memory_order_release);
+}
+
 gboolean CameraManager::onGstMessage(GstBus* /*bus*/, GstMessage* msg, gpointer user_data) {
     CameraManager* manager = static_cast<CameraManager*>(user_data);
 
@@ -305,6 +355,13 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
 
         if (!h264enc) {
             std::cerr << "Failed to create any H264 encoder" << std::endl;
+            if (appsrc_)
+                gst_object_unref(appsrc_);
+            if (convert)
+                gst_object_unref(convert);
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            appsrc_ = nullptr;
             return false;
         }
 
@@ -318,6 +375,22 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
         if (!appsrc_ || !convert || !h264enc || !h264parse || !queue || !hlssink_) {
             std::cerr << "Failed to create GStreamer elements (install gstreamer1.0-plugins-bad for hlssink)"
                       << std::endl;
+            if (appsrc_)
+                gst_object_unref(appsrc_);
+            if (convert)
+                gst_object_unref(convert);
+            if (h264enc)
+                gst_object_unref(h264enc);
+            if (h264parse)
+                gst_object_unref(h264parse);
+            if (queue)
+                gst_object_unref(queue);
+            if (hlssink_)
+                gst_object_unref(hlssink_);
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            appsrc_ = nullptr;
+            hlssink_ = nullptr;
             return false;
         }
 
@@ -325,6 +398,7 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
 
         if (!gst_element_link_many(appsrc_, convert, h264enc, h264parse, queue, hlssink_, nullptr)) {
             std::cerr << "Failed to link GStreamer elements" << std::endl;
+            shutdownGstreamerPipeline();
             return false;
         }
 
@@ -359,17 +433,20 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
         GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
         if (ret == GST_STATE_CHANGE_FAILURE) {
             std::cerr << "Failed to start GStreamer pipeline" << std::endl;
+            shutdownGstreamerPipeline();
             return false;
         }
 
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception in initializeGstreamerPipeline: " << e.what() << std::endl;
+        shutdownGstreamerPipeline();
         return false;
     }
 }
 
 bool CameraManager::startVideoMode(int width, int height, int fps) {
+    std::unique_lock<std::mutex> cameraLock(cameraOpsMutex_);
     if (!isInitialized_ || !camera_) {
         std::cerr << "Camera not initialized" << std::endl;
         return false;
@@ -377,7 +454,13 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
 
     try {
         if (isVideoMode_) {
+            cameraLock.unlock();
             stopVideoMode();
+            cameraLock.lock();
+            if (!isInitialized_ || !camera_) {
+                std::cerr << "Camera not initialized" << std::endl;
+                return false;
+            }
         }
 
         libcamera::StreamRoles roles = {libcamera::StreamRole::VideoRecording};
@@ -400,6 +483,11 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
             int ret = allocator_->allocate(sc.stream());
             if (ret < 0) {
                 std::cerr << "Failed to allocate buffers" << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(bufferMutex_);
+                    allocator_.reset();
+                    buffers_.clear();
+                }
                 return false;
             }
 
@@ -414,13 +502,20 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
 
         if (!initializeGstreamerPipeline(width, height, fps)) {
             std::cerr << "Failed to initialize GStreamer pipeline" << std::endl;
+            rollbackFailedVideoStart();
             return false;
         }
 
-        camera_->requestCompleted.connect(this, &CameraManager::requestComplete);
+        if (videoRequestCompletedConn_) {
+            videoRequestCompletedConn_->disconnect();
+            videoRequestCompletedConn_.reset();
+        }
+        videoRequestCompletedConn_.emplace(
+            camera_->requestCompleted.connect(this, &CameraManager::requestComplete));
 
         if (camera_->start() != 0) {
             std::cerr << "Failed to start camera for video" << std::endl;
+            rollbackFailedVideoStart();
             return false;
         }
 
@@ -428,20 +523,20 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
             auto request = camera_->createRequest();
             if (!request) {
                 std::cerr << "Failed to create request" << std::endl;
-                camera_->stop();
+                rollbackFailedVideoStart();
                 return false;
             }
 
             const auto stream = currentConfig_->at(0).stream();
             if (request->addBuffer(stream, buffer.get()) < 0) {
                 std::cerr << "Failed to add buffer to request" << std::endl;
-                camera_->stop();
+                rollbackFailedVideoStart();
                 return false;
             }
 
             if (camera_->queueRequest(request.get()) != 0) {
                 std::cerr << "Failed to queue request" << std::endl;
-                camera_->stop();
+                rollbackFailedVideoStart();
                 return false;
             }
 
@@ -452,12 +547,14 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
         }
 
         isVideoMode_ = true;
-        captureActive_ = true;
+        captureActive_.store(true, std::memory_order_release);
+        shuttingDown_.store(false, std::memory_order_release);
 
         std::cout << "Video mode started (HLS) at " << width << "x" << height << " @ " << fps << " fps" << std::endl;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception starting video mode: " << e.what() << std::endl;
+        rollbackFailedVideoStart();
         return false;
     }
 }
@@ -468,19 +565,27 @@ bool CameraManager::stopVideoMode() {
     }
 
     try {
-        captureActive_ = false;
+        captureActive_.store(false, std::memory_order_release);
+        shuttingDown_.store(true, std::memory_order_release);
+
+        if (videoRequestCompletedConn_) {
+            videoRequestCompletedConn_->disconnect();
+            videoRequestCompletedConn_.reset();
+        }
 
         if (camera_ && camera_->isRunning()) {
             camera_->stop();
         }
 
         {
-            std::lock_guard<std::mutex> lock(requestMutex_);
-            pendingRequests_.clear();
-            completedRequests_.clear();
+            std::lock_guard<std::mutex> lock(cameraOpsMutex_);
+            {
+                std::lock_guard<std::mutex> rq(requestMutex_);
+                pendingRequests_.clear();
+                completedRequests_.clear();
+            }
+            shutdownGstreamerPipeline();
         }
-
-        shutdownGstreamerPipeline();
 
         {
             std::lock_guard<std::mutex> lock(bufferMutex_);
@@ -488,10 +593,12 @@ bool CameraManager::stopVideoMode() {
             buffers_.clear();
         }
 
+        shuttingDown_.store(false, std::memory_order_release);
         isVideoMode_ = false;
         std::cout << "Video mode stopped" << std::endl;
         return true;
     } catch (const std::exception& e) {
+        shuttingDown_.store(false, std::memory_order_release);
         std::cerr << "Exception stopping video mode: " << e.what() << std::endl;
         return false;
     }
@@ -502,46 +609,59 @@ void CameraManager::requestComplete(libcamera::Request* request) {
         return;
     }
 
+    const bool allowPipeline =
+        captureActive_.load(std::memory_order_acquire) && !shuttingDown_.load(std::memory_order_acquire);
+    if (!allowPipeline) {
+        return;
+    }
+
     auto buffers = request->buffers();
     for (auto& [stream, buffer] : buffers) {
-        if (captureActive_) {
-            auto planes = buffer->planes();
-            auto span = planes[0].map();
+        auto planes = buffer->planes();
+        auto span = planes[0].map();
 
-            if (span) {
-                if (appsrc_) {
-                    GstBuffer* gstBuffer = gst_buffer_new_allocate(nullptr, span.size(), nullptr);
+        if (span) {
+            GstElement* appsrc = appsrc_;
+            if (appsrc) {
+                GstBuffer* gstBuffer = gst_buffer_new_allocate(nullptr, span.size(), nullptr);
 
-                    if (gstBuffer) {
-                        GstMapInfo map;
-                        if (gst_buffer_map(gstBuffer, &map, GST_MAP_WRITE)) {
-                            memcpy(map.data, span.data(), span.size());
-                            gst_buffer_unmap(gstBuffer, &map);
+                if (gstBuffer) {
+                    GstMapInfo map;
+                    if (gst_buffer_map(gstBuffer, &map, GST_MAP_WRITE)) {
+                        memcpy(map.data, span.data(), span.size());
+                        gst_buffer_unmap(gstBuffer, &map);
 
-                            GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
-                            GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+                        GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+                        GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
 
-                            GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), gstBuffer);
-                            if (ret != GST_FLOW_OK) {
-                                std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
-                            }
-                        } else {
+                        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
+                        if (ret != GST_FLOW_OK) {
+                            std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                             gst_buffer_unref(gstBuffer);
                         }
+                    } else {
+                        gst_buffer_unref(gstBuffer);
                     }
                 }
-
-                planes[0].unmap();
             }
 
-            request->reuse();
-            camera_->queueRequest(request);
+            planes[0].unmap();
         }
+
+        request->reuse();
+        camera_->queueRequest(request);
     }
 }
 
 bool CameraManager::reinitialize() {
     std::cout << "Attempting to reinitialize camera..." << std::endl;
+
+    std::unique_lock<std::mutex> cameraLock(cameraOpsMutex_);
+    if (isVideoMode_) {
+        cameraLock.unlock();
+        stopVideoMode();
+        cameraLock.lock();
+    }
 
     try {
         if (camera_) {
@@ -583,7 +703,7 @@ bool CameraManager::reinitialize() {
 
         isInitialized_ = true;
         isVideoMode_ = false;
-        captureActive_ = false;
+        captureActive_.store(false, std::memory_order_release);
         std::cout << "Camera reinitialized: " << camera_->id() << std::endl;
         return true;
     } catch (const std::exception& e) {

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <queue>
@@ -28,18 +29,16 @@
 #include <condition_variable>
 #include <functional>
 #include <gst/gst.h>
-
-namespace libcamera {
-class Camera;
-class CameraManager;
-class FrameBufferAllocator;
-class FrameBuffer;
-class CameraConfiguration;
-class Request;
-}
+#include <libcamera/libcamera.h>
 
 namespace SurfCam {
 
+/// Camera + GStreamer lifecycle (Phase 0 remediation):
+/// 1. Set captureActive_ / shuttingDown_ (memory_order_seq_cst).
+/// 2. Disconnect video requestCompleted slot, then camera_->stop() (RequestCancelled in requestComplete).
+/// 3. shutdownGstreamerPipeline().
+/// 4. Release allocator_ / clear buffers_ under bufferMutex_.
+/// Only streamCheckWorker and main join the HLS worker thread (see main.cpp — strategy A).
 class CameraManager {
 public:
     CameraManager();
@@ -61,6 +60,10 @@ private:
     std::mutex bufferMutex_;
     std::condition_variable bufferCV_;
 
+    /// Serializes initialize, takePicture, startVideoMode, reinitialize. Not held across camera_->stop()
+    /// (see stopVideoMode) so requestComplete never deadlocks with libcamera callbacks.
+    std::mutex cameraOpsMutex_;
+
     // Request completion handling
     void requestComplete(libcamera::Request* request);
     std::vector<std::shared_ptr<libcamera::Request>> pendingRequests_;
@@ -79,6 +82,8 @@ private:
 
     bool initializeGstreamerPipeline(int width, int height, int fps);
     void shutdownGstreamerPipeline();
+    /// Tear down partial/failed video startup (no isVideoMode_).
+    void rollbackFailedVideoStart();
     static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
 
     // Flags and state
@@ -86,6 +91,8 @@ private:
     bool isInitialized_{false};
     bool isVideoMode_{false};
     std::atomic<bool> captureActive_{false};
+    std::atomic<bool> shuttingDown_{false};
+    std::optional<libcamera::Connection> videoRequestCompletedConn_;
 };
 
 }  // namespace SurfCam

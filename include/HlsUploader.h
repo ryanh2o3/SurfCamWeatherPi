@@ -18,7 +18,9 @@
 
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
+#include <list>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -36,7 +38,13 @@ public:
     bool pollAndUpload(ApiClient& api, const std::string& spotId, const std::string& dirPath);
 
 private:
+    static constexpr std::size_t kMaxUploadedSegmentNames = 512;
+
+    void onSegmentUploaded(const std::string& segmentFilename);
+    [[nodiscard]] bool allPlaylistSegmentsUploaded(const std::filesystem::path& playlistPath) const;
+
     std::unordered_set<std::string> uploadedSegments_;
+    std::list<std::string> uploadedSegmentOrder_;
     std::optional<std::filesystem::file_time_type> lastPlaylistWrite_;
 };
 

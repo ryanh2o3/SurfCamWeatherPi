@@ -24,6 +24,7 @@
 #include <iomanip>
 #include <curl/curl.h>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -42,14 +43,8 @@ static size_t ReadCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
 
 namespace SurfCam {
 
-ApiClient::ApiClient(const std::string& apiEndpoint, const std::string& apiKey)
-    : apiEndpoint_(apiEndpoint), apiKey_(apiKey), lastStreamRequestTime_(0) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-}
-
-ApiClient::~ApiClient() {
-    curl_global_cleanup();
-}
+ApiClient::ApiClient(std::string apiEndpoint, std::string apiKey)
+    : apiEndpoint_(std::move(apiEndpoint)), apiKey_(std::move(apiKey)) {}
 
 bool ApiClient::uploadSnapshot(const std::string& imagePath, const std::string& spotId) {
     CURL* curl = nullptr;
@@ -86,8 +81,12 @@ bool ApiClient::uploadSnapshot(const std::string& imagePath, const std::string& 
 
         auto now = std::chrono::system_clock::now();
         auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        struct tm tmBuf {};
+        struct tm* tmPtr = localtime_r(&now_time_t, &tmBuf);
         std::stringstream ss;
-        ss << std::put_time(std::localtime(&now_time_t), "%Y-%m-%dT%H:%M:%S");
+        if (tmPtr) {
+            ss << std::put_time(tmPtr, "%Y-%m-%dT%H:%M:%S");
+        }
         std::string timestamp = ss.str();
 
         part = curl_mime_addpart(mime);
@@ -176,29 +175,13 @@ bool ApiClient::isStreamingRequested(const std::string& spotId) {
                 auto json_response = nlohmann::json::parse(response);
                 if (json_response.contains("stream_requested") && json_response["stream_requested"].is_boolean()) {
                     streaming_requested = json_response["stream_requested"].get<bool>();
-
                     if (streaming_requested) {
-                        std::lock_guard<std::mutex> lock(apiMutex_);
-                        lastStreamRequestTime_ = std::chrono::duration_cast<std::chrono::seconds>(
-                                                     std::chrono::system_clock::now().time_since_epoch())
-                                                     .count();
                         std::cout << "Streaming requested!" << std::endl;
                     }
                 }
             } else {
                 std::cerr << "Failed to check streaming status. Status code: " << http_code << std::endl;
                 std::cerr << "Response: " << response << std::endl;
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(apiMutex_);
-            auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-
-            if (now - lastStreamRequestTime_ < Config::STREAM_TIMEOUT.count()) {
-                streaming_requested = true;
             }
         }
     } catch (const std::exception& e) {

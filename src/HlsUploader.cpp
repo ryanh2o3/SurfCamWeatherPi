@@ -20,6 +20,7 @@
 #include "ApiClient.h"
 #include "Config.h"
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -47,7 +48,41 @@ std::string s3KeyForFile(const std::string& spotId, const std::string& filename)
 
 void HlsUploader::resetSession() {
     uploadedSegments_.clear();
+    uploadedSegmentOrder_.clear();
     lastPlaylistWrite_.reset();
+}
+
+void HlsUploader::onSegmentUploaded(const std::string& segmentFilename) {
+    if (uploadedSegments_.count(segmentFilename) != 0) {
+        return;
+    }
+    while (uploadedSegmentOrder_.size() >= kMaxUploadedSegmentNames) {
+        const std::string& oldest = uploadedSegmentOrder_.front();
+        uploadedSegments_.erase(oldest);
+        uploadedSegmentOrder_.pop_front();
+    }
+    uploadedSegmentOrder_.push_back(segmentFilename);
+    uploadedSegments_.insert(segmentFilename);
+}
+
+bool HlsUploader::allPlaylistSegmentsUploaded(const std::filesystem::path& playlistPath) const {
+    std::ifstream in(playlistPath);
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.size() < 4 || line.compare(line.size() - 3, 3, ".ts") != 0) {
+            continue;
+        }
+        if (uploadedSegments_.count(line) == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const std::string& dirPath) {
@@ -78,7 +113,7 @@ bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const
         }
         const std::string key = s3KeyForFile(spotId, name);
         if (api.uploadLocalFileWithPresign(key, "video/mp2t", p.string())) {
-            uploadedSegments_.insert(name);
+            onSegmentUploaded(name);
         }
     }
 
@@ -95,6 +130,10 @@ bool HlsUploader::pollAndUpload(ApiClient& api, const std::string& spotId, const
         return true;
     }
     if (!fileSizeStable(playlist)) {
+        return true;
+    }
+
+    if (!allPlaylistSegmentsUploaded(playlist)) {
         return true;
     }
 
