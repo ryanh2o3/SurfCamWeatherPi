@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -43,12 +44,25 @@ std::atomic<bool> streamShouldRun{false};
 std::unique_ptr<std::thread> streamThread;
 std::atomic<long> lastStreamRequestTime{0};
 std::atomic<bool> emergencyStopHls{false};
+std::atomic<bool> cameraRecoveryNeeded{false};
 
 namespace {
 
 void stopHlsStreamSession() {
     streamShouldRun.store(false);
     if (streamThread && streamThread->joinable()) {
+        streamThread->join();
+        streamThread.reset();
+    }
+}
+
+/// Ensures streamShouldRun is cleared when the HLS worker thread exits so streamCheckWorker can reap the thread.
+struct StreamShouldRunClear {
+    ~StreamShouldRunClear() { streamShouldRun.store(false); }
+};
+
+void reapFinishedHlsWorker() {
+    if (streamThread && streamThread->joinable() && !streamShouldRun.load(std::memory_order_acquire)) {
         streamThread->join();
         streamThread.reset();
     }
@@ -90,6 +104,7 @@ void snapshotWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
 }
 
 void streamHlsWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
+    StreamShouldRunClear clearStreamFlag;
     SurfCam::HlsUploader uploader;
     uploader.resetSession();
 
@@ -106,40 +121,70 @@ void streamHlsWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
     if (!camera.startVideoMode(SurfCam::Config::CAMERA_WIDTH, SurfCam::Config::CAMERA_HEIGHT,
                                SurfCam::Config::STREAM_FPS)) {
         std::cerr << "[" << getCurrentTimeString() << "] Failed to start video mode" << std::endl;
+        cameraRecoveryNeeded.store(true, std::memory_order_release);
         return;
     }
 
     std::cout << "[" << getCurrentTimeString() << "] HLS encode started → " << SurfCam::Config::HLS_OUTPUT_DIR
               << std::endl;
 
-    while (streamShouldRun.load() && keepRunning.load()) {
-        uploader.pollAndUpload(api, SurfCam::Config::SPOT_ID, SurfCam::Config::HLS_OUTPUT_DIR);
-        std::this_thread::sleep_for(SurfCam::Config::HLS_UPLOAD_POLL);
+    try {
+        while (streamShouldRun.load() && keepRunning.load()) {
+            if (camera.consumeEncoderPipelineFailure()) {
+                std::cerr << "[" << getCurrentTimeString()
+                          << "] GStreamer encoder error; stopping HLS encode session..." << std::endl;
+                break;
+            }
+            uploader.pollAndUpload(api, SurfCam::Config::SPOT_ID, SurfCam::Config::HLS_OUTPUT_DIR);
+            std::this_thread::sleep_for(SurfCam::Config::HLS_UPLOAD_POLL);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[" << getCurrentTimeString() << "] Exception in HLS worker loop: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[" << getCurrentTimeString() << "] Unknown exception in HLS worker loop" << std::endl;
     }
 
     camera.stopVideoMode();
 
-    for (int i = 0; i < 8; ++i) {
-        uploader.pollAndUpload(api, SurfCam::Config::SPOT_ID, SurfCam::Config::HLS_OUTPUT_DIR);
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    try {
+        for (int i = 0; i < 8; ++i) {
+            uploader.pollAndUpload(api, SurfCam::Config::SPOT_ID, SurfCam::Config::HLS_OUTPUT_DIR);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[" << getCurrentTimeString() << "] HLS drain upload failed: " << e.what() << std::endl;
     }
 
     std::cout << "[" << getCurrentTimeString() << "] HLS stream worker finished" << std::endl;
 }
 
 void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
-    int failureCount = 0;
+    int apiFailureStreak = 0;
 
     while (keepRunning.load(std::memory_order_acquire)) {
+        reapFinishedHlsWorker();
+
         if (emergencyStopHls.exchange(false, std::memory_order_acq_rel)) {
             std::cerr << "[" << getCurrentTimeString()
                       << "] Emergency HLS stop requested (monitor); stopping session..." << std::endl;
             stopHlsStreamSession();
-            failureCount = 0;
+            apiFailureStreak = 0;
+        }
+
+        if (cameraRecoveryNeeded.exchange(false, std::memory_order_acq_rel) && keepRunning.load(std::memory_order_acquire)) {
+            std::cerr << "[" << getCurrentTimeString()
+                      << "] Camera recovery after HLS start failure; stopping session and reinitializing..."
+                      << std::endl;
+            stopHlsStreamSession();
+            if (!camera.reinitialize()) {
+                std::cerr << "[" << getCurrentTimeString() << "] Camera reinitialization failed" << std::endl;
+                std::this_thread::sleep_for(std::chrono::minutes(1));
+            }
         }
 
         try {
             bool streamRequested = api.isStreamingRequested(SurfCam::Config::SPOT_ID);
+            apiFailureStreak = 0;
 
             // Re-check after blocking API work so shutdown cannot start a new HLS session mid-iteration.
             if (!keepRunning.load(std::memory_order_acquire)) {
@@ -152,7 +197,6 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
 
             if (streamRequested) {
                 lastStreamRequestTime.store(nowSeconds, std::memory_order_release);
-                failureCount = 0;
             }
 
             bool shouldStream =
@@ -165,33 +209,23 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
                     std::cout << "[" << getCurrentTimeString() << "] Starting HLS upload session..." << std::endl;
                     streamShouldRun.store(true);
                     streamThread = std::make_unique<std::thread>(streamHlsWorker, std::ref(camera), std::ref(api));
-                    failureCount = 0;
                 } else if (!shouldStream && streamThread && streamThread->joinable()) {
                     std::cout << "[" << getCurrentTimeString() << "] Stopping HLS session..." << std::endl;
                     stopHlsStreamSession();
-                    failureCount = 0;
                 }
             }
 
         } catch (const std::exception& e) {
-            std::cerr << "[" << getCurrentTimeString() << "] Exception in stream check: " << e.what() << std::endl;
-            failureCount++;
-        }
-
-        if (failureCount > 3 && keepRunning.load(std::memory_order_acquire)) {
-            std::cerr << "[" << getCurrentTimeString() << "] Multiple failures, attempting recovery" << std::endl;
-
-            stopHlsStreamSession();
-
-            if (!camera.reinitialize()) {
-                std::cerr << "[" << getCurrentTimeString() << "] Camera reinitialization failed" << std::endl;
-                std::this_thread::sleep_for(std::chrono::minutes(1));
-            } else {
-                failureCount = 0;
-            }
+            std::cerr << "[" << getCurrentTimeString() << "] Exception in stream check (API): " << e.what()
+                      << std::endl;
+            apiFailureStreak++;
         }
 
         std::this_thread::sleep_for(SurfCam::Config::STREAM_CHECK_INTERVAL);
+        if (apiFailureStreak > 5 && keepRunning.load(std::memory_order_acquire)) {
+            const int extraSec = std::min(180, (apiFailureStreak - 5) * 20);
+            std::this_thread::sleep_for(std::chrono::seconds(extraSec));
+        }
     }
 }
 

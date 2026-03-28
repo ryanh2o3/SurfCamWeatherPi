@@ -25,9 +25,15 @@
 #include <curl/curl.h>
 #include <chrono>
 #include <ctime>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
     size_t newLength = size * nmemb;
@@ -40,6 +46,55 @@ static size_t ReadCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
     stream->read(ptr, static_cast<std::streamsize>(size * nmemb));
     return static_cast<size_t>(stream->gcount());
 }
+
+namespace {
+
+/// mmap(2) the file for curl_mime_data (avoids a second full-file heap copy in a std::string).
+struct FileMmap {
+    void* addr{MAP_FAILED};
+    size_t len{0};
+
+    FileMmap() = default;
+
+    bool map(const std::string& path) {
+        clear();
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            std::cerr << "Failed to open image file: " << path << " (" << std::strerror(errno) << ")" << std::endl;
+            return false;
+        }
+        struct stat st {};
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            std::cerr << "Invalid snapshot file size: " << path << std::endl;
+            close(fd);
+            return false;
+        }
+        len = static_cast<size_t>(st.st_size);
+        addr = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (addr == MAP_FAILED) {
+            std::cerr << "mmap failed for: " << path << " (" << std::strerror(errno) << ")" << std::endl;
+            len = 0;
+            return false;
+        }
+        return true;
+    }
+
+    void clear() {
+        if (addr != MAP_FAILED) {
+            munmap(addr, len);
+            addr = MAP_FAILED;
+            len = 0;
+        }
+    }
+
+    ~FileMmap() { clear(); }
+
+    FileMmap(const FileMmap&) = delete;
+    FileMmap& operator=(const FileMmap&) = delete;
+};
+
+}  // namespace
 
 namespace SurfCam {
 
@@ -59,25 +114,38 @@ bool ApiClient::uploadSnapshot(const std::string& imagePath, const std::string& 
             return false;
         }
 
-        std::ifstream imageFile(imagePath, std::ios::binary);
-        if (!imageFile) {
-            std::cerr << "Failed to open image file: " << imagePath << std::endl;
+        std::string url = apiEndpoint_ + "/upload-snapshot";
+
+        FileMmap imageMap;
+        if (!imageMap.map(imagePath)) {
+            curl_easy_cleanup(curl);
+            curl = nullptr;
             return false;
         }
 
-        std::string imageData((std::istreambuf_iterator<char>(imageFile)), std::istreambuf_iterator<char>());
-        imageFile.close();
-
-        std::string url = apiEndpoint_ + "/upload-snapshot";
-
         mime = curl_mime_init(curl);
+        if (!mime) {
+            std::cerr << "curl_mime_init failed" << std::endl;
+            curl_easy_cleanup(curl);
+            curl = nullptr;
+            return false;
+        }
+
         curl_mimepart* part;
 
         part = curl_mime_addpart(mime);
         curl_mime_name(part, "file");
         curl_mime_filename(part, "snapshot.jpg");
-        curl_mime_data(part, imageData.c_str(), imageData.size());
         curl_mime_type(part, "image/jpeg");
+        if (curl_mime_data(part, static_cast<const char*>(imageMap.addr), imageMap.len) != CURLE_OK) {
+            std::cerr << "curl_mime_data failed for snapshot file" << std::endl;
+            curl_mime_free(mime);
+            mime = nullptr;
+            curl_easy_cleanup(curl);
+            curl = nullptr;
+            return false;
+        }
+        imageMap.clear();
 
         auto now = std::chrono::system_clock::now();
         auto now_time_t = std::chrono::system_clock::to_time_t(now);
@@ -125,7 +193,9 @@ bool ApiClient::uploadSnapshot(const std::string& imagePath, const std::string& 
                 success = true;
             } else {
                 std::cerr << "Failed to upload snapshot. Status code: " << http_code << std::endl;
-                std::cerr << "Response: " << response.substr(0, 200) << "..." << std::endl;
+                const std::size_t kMax = 200;
+                std::cerr << "Response: " << response.substr(0, kMax)
+                          << (response.size() > kMax ? "..." : "") << std::endl;
             }
         }
     } catch (const std::exception& e) {
@@ -150,7 +220,15 @@ bool ApiClient::isStreamingRequested(const std::string& spotId) {
     struct curl_slist* headers = nullptr;
 
     try {
-        std::string url = apiEndpoint_ + "/check-streaming-requested?spot_id=" + spotId;
+        char* escapedSpot = curl_easy_escape(curl, spotId.c_str(), 0);
+        if (!escapedSpot) {
+            std::cerr << "curl_easy_escape failed for spot_id" << std::endl;
+            if (headers) curl_slist_free_all(headers);
+            if (curl) curl_easy_cleanup(curl);
+            return false;
+        }
+        std::string url = apiEndpoint_ + "/check-streaming-requested?spot_id=" + escapedSpot;
+        curl_free(escapedSpot);
 
         std::string authHeader = "Authorization: ApiKey " + apiKey_;
         headers = curl_slist_append(headers, authHeader.c_str());

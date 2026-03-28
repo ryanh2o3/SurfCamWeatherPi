@@ -104,6 +104,10 @@ CameraManager::CameraManager() : isInitialized_(false), isVideoMode_(false) {
     gst_init(nullptr, nullptr);
 }
 
+bool CameraManager::consumeEncoderPipelineFailure() {
+    return gstPipelineError_.exchange(false, std::memory_order_acq_rel);
+}
+
 CameraManager::~CameraManager() {
     try {
         if (isVideoMode_) {
@@ -298,6 +302,8 @@ bool CameraManager::takePicture(const std::string& outputPath) {
 }
 
 void CameraManager::shutdownGstreamerPipeline() {
+    std::lock_guard<std::mutex> pushLock(pipelinePushMutex_);
+
     if (!pipeline_) {
         return;
     }
@@ -365,6 +371,11 @@ gboolean CameraManager::onGstMessage(GstBus* /*bus*/, GstMessage* msg, gpointer 
 
             g_clear_error(&err);
             g_free(debug_info);
+
+            manager->gstPipelineError_.store(true, std::memory_order_release);
+            if (manager->loop_ && g_main_loop_is_running(manager->loop_)) {
+                g_main_loop_quit(manager->loop_);
+            }
             break;
         }
         case GST_MESSAGE_EOS:
@@ -498,6 +509,7 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
             return false;
         }
 
+        gstPipelineError_.store(false, std::memory_order_release);
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception in initializeGstreamerPipeline: " << e.what() << std::endl;
@@ -692,10 +704,20 @@ void CameraManager::requestComplete(libcamera::Request* request) {
         return;
     }
 
+    std::lock_guard<std::mutex> pushLock(pipelinePushMutex_);
+
+    const bool stillAllow =
+        captureActive_.load(std::memory_order_acquire) && !shuttingDown_.load(std::memory_order_acquire);
+    GstElement* appsrc = appsrc_;
+    if (!stillAllow || !appsrc) {
+        recycleVideoRequest(request);
+        return;
+    }
+
     auto buffers = request->buffers();
     for (auto& [stream, buffer] : buffers) {
-        GstElement* appsrc = appsrc_;
-        if (!appsrc) {
+        GstElement* asrc = appsrc_;
+        if (!asrc) {
             continue;
         }
 
@@ -715,7 +737,7 @@ void CameraManager::requestComplete(libcamera::Request* request) {
             gst_buffer_unmap(gstBuffer, &map);
             GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
-            GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
+            GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(asrc), gstBuffer);
             if (ret != GST_FLOW_OK) {
                 std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                 gst_buffer_unref(gstBuffer);
@@ -739,7 +761,7 @@ void CameraManager::requestComplete(libcamera::Request* request) {
                     GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
                     GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
 
-                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
+                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(asrc), gstBuffer);
                     if (ret != GST_FLOW_OK) {
                         std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                         gst_buffer_unref(gstBuffer);

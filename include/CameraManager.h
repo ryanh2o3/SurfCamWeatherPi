@@ -40,6 +40,7 @@ namespace SurfCam {
 /// 4. Release allocator_ under bufferMutex_ (frame buffers stay owned by the allocator).
 /// videoTeardownMutex_ serializes stopVideoMode vs rollbackFailedVideoStart; startVideoMode unlocks
 /// cameraOpsMutex_ before calling rollback so lock order cannot deadlock with stop.
+/// pipelinePushMutex_ serializes libcamera requestComplete pushes vs shutdownGstreamerPipeline teardown.
 /// Only streamCheckWorker and main join the HLS worker thread (see main.cpp — strategy A).
 class CameraManager {
 public:
@@ -51,6 +52,9 @@ public:
     bool startVideoMode(int width, int height, int fps);
     bool stopVideoMode();
     bool reinitialize();
+
+    /// True once after the GStreamer bus reports GST_MESSAGE_ERROR (cleared by this call).
+    bool consumeEncoderPipelineFailure();
 
 private:
     // LibCamera members
@@ -80,6 +84,10 @@ private:
     GMainLoop* loop_{nullptr};
     std::thread gstThread_;
     std::atomic<bool> gstRunning_{false};
+    std::atomic<bool> gstPipelineError_{false};
+
+    /// Held around appsrc pushes and around pipeline teardown (see shutdownGstreamerPipeline).
+    std::mutex pipelinePushMutex_;
 
     /// Serializes stopVideoMode vs rollbackFailedVideoStart (and overlapping teardown). Not held in requestComplete.
     std::mutex videoTeardownMutex_;
