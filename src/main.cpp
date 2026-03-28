@@ -74,6 +74,15 @@ void signalHandler(int /*signum*/) {
     keepRunning.store(false);
 }
 
+void installSignalHandlers() {
+    struct sigaction sa {};
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
 std::string getCurrentTimeString() {
     const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     struct tm tmBuf {};
@@ -129,7 +138,8 @@ void streamHlsWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) {
               << std::endl;
 
     try {
-        while (streamShouldRun.load() && keepRunning.load()) {
+        while (streamShouldRun.load(std::memory_order_acquire) && keepRunning.load(std::memory_order_acquire) &&
+               !emergencyStopHls.load(std::memory_order_acquire)) {
             if (camera.consumeEncoderPipelineFailure()) {
                 std::cerr << "[" << getCurrentTimeString()
                           << "] GStreamer encoder error; stopping HLS encode session..." << std::endl;
@@ -183,26 +193,32 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
         }
 
         try {
-            bool streamRequested = api.isStreamingRequested(SurfCam::Config::SPOT_ID);
-            apiFailureStreak = 0;
+            auto streamState = api.isStreamingRequested(SurfCam::Config::SPOT_ID);
 
             // Re-check after blocking API work so shutdown cannot start a new HLS session mid-iteration.
             if (!keepRunning.load(std::memory_order_acquire)) {
                 continue;
             }
 
-            auto now = std::chrono::system_clock::now();
-            auto nowSeconds =
+            const auto now = std::chrono::system_clock::now();
+            const auto nowSeconds =
                 std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
-            if (streamRequested) {
-                lastStreamRequestTime.store(nowSeconds, std::memory_order_release);
+            if (streamState.has_value()) {
+                apiFailureStreak = 0;
+                if (*streamState) {
+                    lastStreamRequestTime.store(nowSeconds, std::memory_order_release);
+                }
+            } else {
+                apiFailureStreak++;
             }
 
-            bool shouldStream =
-                streamRequested ||
-                (nowSeconds - lastStreamRequestTime.load(std::memory_order_acquire) <
-                 SurfCam::Config::STREAM_TIMEOUT.count());
+            const bool apiSaysStreamOn = streamState.has_value() && *streamState;
+            const long lastReqSec = lastStreamRequestTime.load(std::memory_order_acquire);
+            const bool withinGrace =
+                lastReqSec != 0 &&
+                (nowSeconds - lastReqSec) < SurfCam::Config::STREAM_TIMEOUT.count();
+            const bool shouldStream = apiSaysStreamOn || withinGrace;
 
             if (keepRunning.load(std::memory_order_acquire)) {
                 if (shouldStream && (!streamThread || !streamThread->joinable())) {
@@ -324,8 +340,7 @@ void monitorSystemResources() {
 }
 
 int main() {
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    installSignalHandlers();
 
     if (!SurfCam::Config::loadFromEnvironment(std::cerr)) {
         return 1;

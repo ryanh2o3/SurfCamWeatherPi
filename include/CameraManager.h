@@ -57,6 +57,8 @@ public:
     bool consumeEncoderPipelineFailure();
 
 private:
+    /// Caller must hold `videoTeardownMutex_` (e.g. `stopVideoMode` catch path).
+    void bestEffortVideoTeardownWhileHoldingTeardownLock();
     // LibCamera members
     std::unique_ptr<libcamera::CameraManager> cameraManager_;
     std::shared_ptr<libcamera::Camera> camera_;
@@ -85,6 +87,8 @@ private:
     std::thread gstThread_;
     std::atomic<bool> gstRunning_{false};
     std::atomic<bool> gstPipelineError_{false};
+    /// After a failed `reinitialize()`, snapshots are skipped until the next successful reinit.
+    std::atomic<bool> snapshotsPaused_{false};
 
     /// Held around appsrc pushes and around pipeline teardown (see shutdownGstreamerPipeline).
     std::mutex pipelinePushMutex_;

@@ -155,6 +155,7 @@ bool CameraManager::initialize() {
         }
 
         isInitialized_ = true;
+        snapshotsPaused_.store(false, std::memory_order_release);
         std::cout << "Camera initialized: " << camera_->id() << std::endl;
         return true;
     } catch (const std::exception& e) {
@@ -165,6 +166,10 @@ bool CameraManager::initialize() {
 
 bool CameraManager::takePicture(const std::string& outputPath) {
     std::unique_lock<std::mutex> cameraLock(cameraOpsMutex_);
+    if (snapshotsPaused_.load(std::memory_order_acquire)) {
+        std::cerr << "Snapshots paused (camera recovery failed); skipping capture" << std::endl;
+        return false;
+    }
     if (!isInitialized_ || !camera_) {
         std::cerr << "Camera not initialized" << std::endl;
         return false;
@@ -637,6 +642,31 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
     }
 }
 
+void CameraManager::bestEffortVideoTeardownWhileHoldingTeardownLock() {
+    captureActive_.store(false, std::memory_order_release);
+    shuttingDown_.store(false, std::memory_order_release);
+    try {
+        disconnectVideoRequestSlot();
+        stopCameraIfRunning(camera_.get());
+        {
+            std::lock_guard<std::mutex> lock(cameraOpsMutex_);
+            {
+                std::lock_guard<std::mutex> rq(requestMutex_);
+                pendingRequests_.clear();
+                completedRequests_.clear();
+            }
+            shutdownGstreamerPipeline();
+        }
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex_);
+            allocator_.reset();
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Secondary error during video teardown recovery: " << e.what() << std::endl;
+    }
+    isVideoMode_ = false;
+}
+
 bool CameraManager::stopVideoMode() {
     std::lock_guard<std::mutex> tdLock(videoTeardownMutex_);
     if (!isVideoMode_) {
@@ -671,8 +701,8 @@ bool CameraManager::stopVideoMode() {
         std::cout << "Video mode stopped" << std::endl;
         return true;
     } catch (const std::exception& e) {
-        shuttingDown_.store(false, std::memory_order_release);
         std::cerr << "Exception stopping video mode: " << e.what() << std::endl;
+        bestEffortVideoTeardownWhileHoldingTeardownLock();
         return false;
     }
 }
@@ -741,6 +771,7 @@ void CameraManager::requestComplete(libcamera::Request* request) {
             if (ret != GST_FLOW_OK) {
                 std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                 gst_buffer_unref(gstBuffer);
+                gstPipelineError_.store(true, std::memory_order_release);
             }
         } else {
             gst_buffer_unref(gstBuffer);
@@ -765,6 +796,7 @@ void CameraManager::requestComplete(libcamera::Request* request) {
                     if (ret != GST_FLOW_OK) {
                         std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                         gst_buffer_unref(gstBuffer);
+                        gstPipelineError_.store(true, std::memory_order_release);
                     }
                 } else {
                     gst_buffer_unref(gstBuffer);
@@ -813,6 +845,7 @@ bool CameraManager::reinitialize() {
         auto cameras = cameraManager_->cameras();
         if (cameras.empty()) {
             std::cerr << "No cameras available" << std::endl;
+            snapshotsPaused_.store(true, std::memory_order_release);
             return false;
         }
 
@@ -820,16 +853,19 @@ bool CameraManager::reinitialize() {
 
         if (camera_->acquire() != 0) {
             std::cerr << "Failed to acquire camera" << std::endl;
+            snapshotsPaused_.store(true, std::memory_order_release);
             return false;
         }
 
         isInitialized_ = true;
         isVideoMode_ = false;
         captureActive_.store(false, std::memory_order_release);
+        snapshotsPaused_.store(false, std::memory_order_release);
         std::cout << "Camera reinitialized: " << camera_->id() << std::endl;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception reinitializing camera: " << e.what() << std::endl;
+        snapshotsPaused_.store(true, std::memory_order_release);
         return false;
     }
 }

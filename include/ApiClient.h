@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 
 namespace SurfCam {
@@ -29,8 +30,8 @@ public:
     ~ApiClient() = default;
 
     bool uploadSnapshot(const std::string& imagePath, const std::string& spotId);
-    /// True only when the API JSON says stream is requested (timeout/grace handled in main — R9).
-    bool isStreamingRequested(const std::string& spotId);
+    /// `true` / `false` when the API returns a definitive 200 + boolean; empty on network/HTTP/parse errors.
+    std::optional<bool> isStreamingRequested(const std::string& spotId);
 
     /// POST /hls/presign then PUT file bytes to the returned URL (S3 presigned PUT).
     bool uploadLocalFileWithPresign(const std::string& objectKey, const std::string& contentType,

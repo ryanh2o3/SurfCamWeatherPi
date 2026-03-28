@@ -29,15 +29,26 @@ namespace SurfCam {
 
 namespace {
 
+void trimTrailingCarriageReturn(std::string& line) {
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+}
+
 bool fileSizeStable(const std::filesystem::path& p) {
     std::error_code ec;
     const auto a = std::filesystem::file_size(p, ec);
     if (ec || a == 0) {
         return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     const auto b = std::filesystem::file_size(p, ec);
-    return !ec && a == b;
+    if (ec || b != a) {
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto c = std::filesystem::file_size(p, ec);
+    return !ec && c == b;
 }
 
 std::string s3KeyForFile(const std::string& spotId, const std::string& filename) {
@@ -72,6 +83,7 @@ bool HlsUploader::allPlaylistSegmentsUploaded(const std::filesystem::path& playl
     }
     std::string line;
     while (std::getline(in, line)) {
+        trimTrailingCarriageReturn(line);
         if (line.empty() || line[0] == '#') {
             continue;
         }
