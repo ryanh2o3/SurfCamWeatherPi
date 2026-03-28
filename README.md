@@ -7,7 +7,7 @@ A Raspberry Pi app that captures surf conditions and streams live video. It take
 This runs on a Raspberry Pi Zero W with a camera. It does two main things:
 
 - **Takes snapshots**: Every 30 seconds it snaps a photo and uploads it to an API
-- **Streams video**: When someone asks for it, it streams live video to AWS Kinesis
+- **Live HLS to S3**: When someone asks for it, it encodes HLS locally (`.m3u8` + `.ts`) and uploads each file to your bucket using **presigned PUT** URLs from your API (no AWS SDK on the Pi)
 
 Since the Pi Zero is pretty limited, the app keeps an eye on things like:
 
@@ -32,14 +32,13 @@ Written in C++17. Here's what the main pieces do:
 
    - Sends HTTP requests to the API
    - Uploads photos
-   - Gets AWS credentials when needed
+   - Calls `POST /hls/presign` and **PUT**s segment/playlist bytes to S3
    - Checks if anyone wants to watch a stream
 
-3. **KinesisStreamer** (`src/KinesisStreamer.cpp`)
+3. **HlsUploader** (`src/HlsUploader.cpp`)
 
-   - Connects to AWS Kinesis Video Streams
-   - Encodes and uploads video frames
-   - Breaks video into chunks that Kinesis can handle
+   - Watches the local HLS directory (`/tmp/surfcam-hls` by default)
+   - Uploads finished `.ts` segments first, then `index.m3u8`
 
 4. **Main Application** (`src/main.cpp`)
    - Keeps everything working together
@@ -62,8 +61,7 @@ Written in C++17. Here's what the main pieces do:
 - C++17 compiler (gcc or clang)
 - OpenCV
 - libcamera
-- GStreamer 1.0
-- AWS C++ SDK
+- GStreamer 1.0 (including **plugins-bad** for `hlssink`)
 - libcurl
 - pthread
 
@@ -82,15 +80,11 @@ sudo apt install -y libcamera-dev libcamera-apps
 # OpenCV
 sudo apt install -y libopencv-dev
 
-# GStreamer
-sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+# GStreamer (hlssink lives in plugins-bad)
+sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
 # HTTP client
 sudo apt install -y libcurl4-openssl-dev
-
-# AWS SDK
-# You'll need to follow the AWS C++ SDK installation guide:
-# https://github.com/aws/aws-sdk-cpp/blob/master/Docs/CMake_Parameters.md
 
 # JSON library
 sudo apt install -y nlohmann-json3-dev
@@ -124,9 +118,9 @@ Settings are in `include/Config.h`. You can change:
 - STREAM_CHECK_INTERVAL: How often to check if someone wants to stream (default: 5 seconds)
 - CAMERA_WIDTH/HEIGHT: Video size (default: 1280x720)
 - STREAM_FPS: Video frame rate (default: 15 fps)
-- API_ENDPOINT: Where to send photos
-- KINESIS_STREAM_NAME: AWS Kinesis stream name
-- AWS_REGION: AWS region
+- API_ENDPOINT: Base URL for the API (snapshots + presign)
+- HLS_OUTPUT_DIR: Where GStreamer writes `index.m3u8` and segments (default: /tmp/surfcam-hls)
+- HLS_PRESIGN_PATH: Path appended to API_ENDPOINT for presigned PUTs (default: /hls/presign)
 ```
 
 ### Environment Variables
@@ -198,15 +192,14 @@ It runs three threads that keep things going:
 2. **Stream check thread**: Looks for streaming requests and handles streams
 3. **Monitor thread**: Keeps an eye on memory and temperature
 
-### Streaming
+### Streaming (HLS → S3)
 
 When someone wants to watch:
 
-1. Gets AWS credentials from the API
-2. Connects to Kinesis Video Streams
-3. Starts recording video with H.264 encoding
-4. Sends video chunks to Kinesis
-5. Stops automatically after 30 seconds if no one's watching
+1. Polls the API (`check-streaming-requested`) and keeps going for `STREAM_TIMEOUT` after the last request
+2. Clears the local HLS directory and starts **libcamera → GStreamer** with **`hlssink`** (H.264 + MPEG-TS segments)
+3. **`HlsUploader`** uploads each closed `.ts` file, then an updated **`index.m3u8`**, using **`POST .../hls/presign`** + **HTTPS PUT** (see [AWS_HLS_OPTION_B.md](AWS_HLS_OPTION_B.md))
+4. Stops when requests end; your **CloudFront** (or public bucket URL) serves the playlist to browsers
 
 ### Keeping things stable
 
@@ -215,7 +208,7 @@ Since the Pi Zero is small, the app watches out for problems:
 - **Memory**: Checks every 30 seconds and stops streaming if memory gets too low
 - **Temperature**: Watches CPU temp and stops streaming if it gets too hot
 - **Recovery**: Tries to fix itself if the camera or network has issues
-- **Fragment limits**: Keeps video chunks small so it doesn't run out of memory
+- **HLS window**: `hlssink` keeps only a small number of local segment files (`HLS_PLAYLIST_MAX_FILES`)
 
 ## Troubleshooting
 
@@ -262,21 +255,19 @@ curl -X POST https://treblesurf.com/api/upload-snapshot
 
 ### Streaming not working?
 
-- Make sure AWS credentials are correct
-- Check the Kinesis stream exists in the right region
-- Make sure your internet is fast enough
+- Implement **`POST /api/hls/presign`** on your backend and return a valid S3 presigned **PUT** URL (see [AWS_HLS_OPTION_B.md](AWS_HLS_OPTION_B.md))
+- Install **`gstreamer1.0-plugins-bad`** so `hlssink` / `hlssink2` exists (`gst-inspect-1.0 hlssink`)
+- Ensure the Pi can reach your API and S3 over HTTPS
 - Check if the Pi is overheating
 
 ## Pi Zero tweaks
 
-Since the Pi Zero is pretty slow, I've made some adjustments:
+Since the Pi Zero is pretty slow, the defaults lean conservative:
 
-- Smaller video chunks (256KB instead of the default)
-- Less storage used (32MB instead of 128MB)
-- Lower video quality (400Kbps bitrate)
-- Longer timeouts for slow internet
-- Less frame buffering
-- Tries to prevent CPU throttling
+- Lower video quality (400Kbps bitrate in GStreamer)
+- Short HLS segment target duration and a small rolling file count
+- Longer timeouts for slow internet on uploads
+- Single-threaded **x264enc** when that encoder is used; hardware encoders use their own bitrate property
 
 ## API endpoints
 
@@ -291,8 +282,9 @@ The app talks to these endpoints:
 
   - Returns JSON saying yes or no
 
-- `GET /api/get-streaming-credentials`: Get AWS credentials for streaming
-  - Returns JSON with AWS credentials
+- `POST /api/hls/presign`: Get a presigned S3 PUT URL for one HLS object
+  - Body: JSON `{"key":"spots/<spot_id>/live/segment-00001.ts","content_type":"video/mp2t"}` (or `application/vnd.apple.mpegurl` for the playlist)
+  - Response: JSON `{"url":"https://...","headers":{}}` — optional `headers` object must be sent on the PUT if your signer requires it
 
 ## License
 

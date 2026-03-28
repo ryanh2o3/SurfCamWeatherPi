@@ -49,15 +49,18 @@ struct Config {
     }();
     inline static const int REQUEST_TIMEOUT = 10;
 
+    // HLS (local staging before S3 via presigned PUT)
+    inline static const std::string HLS_OUTPUT_DIR = "/tmp/surfcam-hls";
+    inline static const std::string HLS_PLAYLIST_NAME = "index.m3u8";
+    inline static const int HLS_SEGMENT_TARGET_DURATION_SEC = 5;
+    inline static const int HLS_PLAYLIST_MAX_FILES = 8;
+    inline static const std::string HLS_PRESIGN_PATH = "/hls/presign";
+
     // Timing
     inline static const std::chrono::seconds SNAPSHOT_INTERVAL{30};
     inline static const std::chrono::seconds STREAM_CHECK_INTERVAL{5};
     inline static const std::chrono::seconds STREAM_TIMEOUT{30};
-    inline static const int CREDENTIAL_REFRESH_SECONDS = 150; // Refresh before 180s KVS token expiry
-
-    // AWS
-    inline static const std::string AWS_REGION = "eu-west-1";
-    inline static const std::string KINESIS_STREAM_NAME = "treblesurf-webcam";
+    inline static const std::chrono::milliseconds HLS_UPLOAD_POLL{400};
 
     // Camera
     inline static const int CAMERA_WIDTH = 1280;
@@ -65,10 +68,8 @@ struct Config {
     inline static const int STREAM_FPS = 15;
     inline static const std::string IMAGE_PATH = "/home/ryanpatton/image.jpg";
 
-    // Pi Zero tuning
-    inline static const int MAX_FRAGMENT_SIZE = 256 * 1024;       // 256KB fragments
-    inline static const int KVS_STORAGE_SIZE  = 32 * 1024 * 1024; // 32MB internal buffer
-    inline static const int GSTREAMER_BITRATE = 400000;            // 400Kbps
+    // Pi Zero tuning (GStreamer encoder)
+    inline static const int GSTREAMER_BITRATE = 400000;  // 400Kbps
 };
 
 }  // namespace SurfCam

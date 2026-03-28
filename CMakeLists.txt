@@ -11,10 +11,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")  # Add optimization flag for Pi Ze
 
 find_package(CURL REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(aws-cpp-sdk-core REQUIRED)
-find_package(aws-cpp-sdk-kinesisvideo REQUIRED)
-find_package(aws-cpp-sdk-kinesis-video-media REQUIRED)
-find_package(KinesisVideoProducerCpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBCAMERA REQUIRED libcamera)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
@@ -43,18 +39,14 @@ add_executable(surfcam
     src/main.cpp
     src/CameraManager.cpp
     src/ApiClient.cpp
-    src/KinesisStreamer.cpp
+    src/HlsUploader.cpp
 )
 
 target_link_libraries(surfcam
     ${LIBCAMERA_LIBRARIES}
     ${CURL_LIBRARIES}
     ${OpenCV_LIBS}
-    aws-cpp-sdk-core
-    aws-cpp-sdk-kinesisvideo
-    aws-cpp-sdk-kinesis-video-media
     pthread
-    KinesisVideoProducerCpp
     ${GSTREAMER_LIBRARIES}
 )
 

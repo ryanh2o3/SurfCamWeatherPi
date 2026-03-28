@@ -1,8 +1,6 @@
 # Scaleway Migration Options
 
-The current architecture streams H.264 video from a Pi Zero W to AWS Kinesis Video
-Streams (KVS). Scaleway has no KVS equivalent, so switching requires a different
-streaming backend. Below are three concrete options, ordered by complexity.
+The **in-repo Pi client** now uses **local HLS + S3 presigned PUT** (see `HlsUploader`, `AWS_HLS_OPTION_B.md`). The notes below still apply if you want **RTMP to a VPS** or **HLS to Scaleway Object Storage** instead of AWS S3.
 
 ---
 

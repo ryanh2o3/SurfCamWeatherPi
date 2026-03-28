@@ -18,28 +18,26 @@
 
 #pragma once
 
+#include <filesystem>
+#include <optional>
 #include <string>
-#include <mutex>
+#include <unordered_set>
 
 namespace SurfCam {
 
-class ApiClient {
+class ApiClient;
+
+/// Watches the local HLS directory and uploads new .ts segments and the playlist via presigned PUT.
+class HlsUploader {
 public:
-    ApiClient(const std::string& apiEndpoint, const std::string& apiKey);
-    ~ApiClient();
+    void resetSession();
 
-    bool uploadSnapshot(const std::string& imagePath, const std::string& spotId);
-    bool isStreamingRequested(const std::string& spotId);
-
-    /// POST /hls/presign then PUT file bytes to the returned URL (S3 presigned PUT).
-    bool uploadLocalFileWithPresign(const std::string& objectKey, const std::string& contentType,
-                                    const std::string& filePath);
+    /// Upload any new stable segments, then the playlist if it changed. Returns false if dir missing.
+    bool pollAndUpload(ApiClient& api, const std::string& spotId, const std::string& dirPath);
 
 private:
-    std::string apiEndpoint_;
-    std::string apiKey_;
-    long lastStreamRequestTime_{0};
-    std::mutex apiMutex_;
+    std::unordered_set<std::string> uploadedSegments_;
+    std::optional<std::filesystem::file_time_type> lastPlaylistWrite_;
 };
 
 }  // namespace SurfCam

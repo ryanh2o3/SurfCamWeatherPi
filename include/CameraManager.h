@@ -40,12 +40,6 @@ class Request;
 
 namespace SurfCam {
 
-struct FrameData {
-std::vector<uint8_t> data;
-uint64_t timestamp;
-bool keyFrame;
-};
-
 class CameraManager {
 public:
     CameraManager();
@@ -55,7 +49,6 @@ public:
     bool takePicture(const std::string& outputPath);
     bool startVideoMode(int width, int height, int fps);
     bool stopVideoMode();
-    bool getEncodedFrame(FrameData& frameData);
     bool reinitialize();
 
 private:
@@ -75,27 +68,19 @@ private:
     std::mutex requestMutex_;
     std::condition_variable requestCV_;
 
-    // GStreamer pipeline for H.264 encoding
+    // GStreamer pipeline: appsrc -> H.264 -> hlssink
     GstElement* pipeline_{nullptr};
     GstElement* appsrc_{nullptr};
-    GstElement* appsink_{nullptr};
+    GstElement* hlssink_{nullptr};
     GstBus* bus_{nullptr};
     GMainLoop* loop_{nullptr};
     std::thread gstThread_;
     bool gstRunning_{false};
-    
-    // Initialize and manage GStreamer pipeline
+
     bool initializeGstreamerPipeline(int width, int height, int fps);
     void shutdownGstreamerPipeline();
     static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
-    static void onNewEncodedBuffer(GstElement* sink, gpointer user_data);
-    
-    // Buffer management
-    std::queue<FrameData> encodedFrames_;
-    std::mutex encodedFramesMutex_;
-    std::condition_variable encodedFramesCV_;
-    size_t maxBufferedFrames_{10}; // Limit number of buffered frames
-    
+
     // Flags and state
     size_t nextBufferIndex_{0};
     bool isInitialized_{false};
@@ -103,4 +88,4 @@ private:
     std::atomic<bool> captureActive_{false};
 };
 
-}   // namespace SurfCam
+}  // namespace SurfCam
