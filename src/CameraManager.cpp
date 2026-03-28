@@ -18,12 +18,13 @@
 
 #include "CameraManager.h"
 #include "Config.h"
+#include "LibcameraCompat.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
 #include <thread>
-#include <opencv2/opencv.hpp>
+#include <utility>
 #include <libcamera/libcamera.h>
 #include <gst/gst.h>
 #include <gst/gstpluginfeature.h>
@@ -33,20 +34,69 @@ namespace SurfCam {
 
 namespace {
 
-/// Disconnects libcamera requestCompleted slot on scope exit (R4).
-class ScopedRequestCompletedConnection {
-public:
-    explicit ScopedRequestCompletedConnection(libcamera::Connection conn) : conn_(std::move(conn)) {}
-    ~ScopedRequestCompletedConnection() { conn_.disconnect(); }
+/// Unlocks a held unique_lock for rollback/stop that take videoTeardownMutex_ (avoids lock order deadlock).
+struct ScopedUnlockUniqueLock {
+    explicit ScopedUnlockUniqueLock(std::unique_lock<std::mutex>& lock) : lock_(lock) { lock_.unlock(); }
+    ~ScopedUnlockUniqueLock() {
+        if (!lock_.owns_lock()) {
+            lock_.lock();
+        }
+    }
 
-    ScopedRequestCompletedConnection(const ScopedRequestCompletedConnection&) = delete;
-    ScopedRequestCompletedConnection& operator=(const ScopedRequestCompletedConnection&) = delete;
-    ScopedRequestCompletedConnection(ScopedRequestCompletedConnection&&) = delete;
-    ScopedRequestCompletedConnection& operator=(ScopedRequestCompletedConnection&&) = delete;
+    ScopedUnlockUniqueLock(const ScopedUnlockUniqueLock&) = delete;
+    ScopedUnlockUniqueLock& operator=(const ScopedUnlockUniqueLock&) = delete;
 
 private:
-    libcamera::Connection conn_;
+    std::unique_lock<std::mutex>& lock_;
 };
+
+void stopCameraIfRunning(libcamera::Camera* cam) {
+    if (!cam) {
+        return;
+    }
+#if SURFCAM_LIBCAMERA_LEGACY
+    cam->stop();
+#else
+    if (cam->isRunning()) {
+        cam->stop();
+    }
+#endif
+}
+
+/// Disconnects still-capture requestCompleted slot (R4). libcamera < 0.2 has no Connection type.
+#if SURFCAM_LIBCAMERA_LEGACY
+struct ScopedPhotoRequestCompletedConnection {
+    libcamera::Camera* cam_;
+    CameraManager* self_;
+
+    template <typename F>
+    ScopedPhotoRequestCompletedConnection(libcamera::Camera* c, CameraManager* s, F&& f) : cam_(c), self_(s) {
+        cam_->requestCompleted.connect(s, std::forward<F>(f));
+    }
+
+    ~ScopedPhotoRequestCompletedConnection() {
+        if (cam_) {
+            cam_->requestCompleted.disconnect(self_);
+        }
+    }
+
+    ScopedPhotoRequestCompletedConnection(const ScopedPhotoRequestCompletedConnection&) = delete;
+    ScopedPhotoRequestCompletedConnection& operator=(const ScopedPhotoRequestCompletedConnection&) = delete;
+};
+#else
+struct ScopedPhotoRequestCompletedConnection {
+    libcamera::Connection conn_;
+
+    template <typename F>
+    ScopedPhotoRequestCompletedConnection(libcamera::Camera* c, CameraManager* s, F&& f)
+        : conn_(c->requestCompleted.connect(s, std::forward<F>(f))) {}
+
+    ~ScopedPhotoRequestCompletedConnection() { conn_.disconnect(); }
+
+    ScopedPhotoRequestCompletedConnection(const ScopedPhotoRequestCompletedConnection&) = delete;
+    ScopedPhotoRequestCompletedConnection& operator=(const ScopedPhotoRequestCompletedConnection&) = delete;
+};
+#endif
 
 }  // namespace
 
@@ -61,16 +111,13 @@ CameraManager::~CameraManager() {
         }
 
         if (camera_) {
-            if (camera_->isRunning()) {
-                camera_->stop();
-            }
+            stopCameraIfRunning(camera_.get());
             camera_->release();
         }
 
         {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             allocator_.reset();
-            buffers_.clear();
         }
 
         if (cameraManager_) {
@@ -162,7 +209,7 @@ bool CameraManager::takePicture(const std::string& outputPath) {
             return false;
         }
 
-        if (request->addBuffer(streamConfig.stream(), buffers[0]) < 0) {
+        if (request->addBuffer(streamConfig.stream(), buffers[0].get()) < 0) {
             std::cerr << "Failed to add buffer to request" << std::endl;
             return false;
         }
@@ -171,11 +218,11 @@ bool CameraManager::takePicture(const std::string& outputPath) {
         std::condition_variable completionCV;
         bool completed = false;
 
-        ScopedRequestCompletedConnection photoSlot(camera_->requestCompleted.connect([&](libcamera::Request* /*req*/) {
+        ScopedPhotoRequestCompletedConnection photoSlot(camera_.get(), this, [&](libcamera::Request* /*req*/) {
             std::lock_guard<std::mutex> lock(completionMutex);
             completed = true;
             completionCV.notify_one();
-        }));
+        });
 
         if (camera_->start() != 0) {
             std::cerr << "Failed to start camera" << std::endl;
@@ -200,6 +247,25 @@ bool CameraManager::takePicture(const std::string& outputPath) {
         }
 
         auto buffer = request->buffers().begin()->second;
+
+#if SURFCAM_LIBCAMERA_LEGACY
+        LegacyMappedPlane mapped;
+        if (!mapped.mapRead(buffer)) {
+            std::cerr << "Failed to map buffer" << std::endl;
+            camera_->stop();
+            return false;
+        }
+
+        std::ofstream output(outputPath, std::ios::binary);
+        if (!output.is_open()) {
+            std::cerr << "Failed to open output file" << std::endl;
+            camera_->stop();
+            return false;
+        }
+
+        output.write(static_cast<const char*>(mapped.data()), mapped.size());
+        output.close();
+#else
         auto span = buffer->planes()[0].map();
         if (!span) {
             std::cerr << "Failed to map buffer" << std::endl;
@@ -218,6 +284,7 @@ bool CameraManager::takePicture(const std::string& outputPath) {
         output.close();
 
         buffer->planes()[0].unmap();
+#endif
 
         camera_->stop();
 
@@ -225,8 +292,7 @@ bool CameraManager::takePicture(const std::string& outputPath) {
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception taking picture: " << e.what() << std::endl;
-        if (camera_ && camera_->isRunning())
-            camera_->stop();
+        stopCameraIfRunning(camera_.get());
         return false;
     }
 }
@@ -266,13 +332,9 @@ void CameraManager::shutdownGstreamerPipeline() {
 }
 
 void CameraManager::rollbackFailedVideoStart() {
-    if (videoRequestCompletedConn_) {
-        videoRequestCompletedConn_->disconnect();
-        videoRequestCompletedConn_.reset();
-    }
-    if (camera_ && camera_->isRunning()) {
-        camera_->stop();
-    }
+    std::lock_guard<std::mutex> tdLock(videoTeardownMutex_);
+    disconnectVideoRequestSlot();
+    stopCameraIfRunning(camera_.get());
     {
         std::lock_guard<std::mutex> rq(requestMutex_);
         pendingRequests_.clear();
@@ -282,7 +344,6 @@ void CameraManager::rollbackFailedVideoStart() {
     {
         std::lock_guard<std::mutex> lock(bufferMutex_);
         allocator_.reset();
-        buffers_.clear();
     }
     captureActive_.store(false, std::memory_order_release);
     shuttingDown_.store(false, std::memory_order_release);
@@ -425,9 +486,9 @@ bool CameraManager::initializeGstreamerPipeline(int width, int height, int fps) 
 
         loop_ = g_main_loop_new(nullptr, FALSE);
         gstThread_ = std::thread([this]() {
-            gstRunning_ = true;
+            gstRunning_.store(true, std::memory_order_release);
             g_main_loop_run(loop_);
-            gstRunning_ = false;
+            gstRunning_.store(false, std::memory_order_release);
         });
 
         GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
@@ -486,56 +547,60 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
                 {
                     std::lock_guard<std::mutex> lock(bufferMutex_);
                     allocator_.reset();
-                    buffers_.clear();
                 }
                 return false;
-            }
-
-            const std::vector<std::unique_ptr<libcamera::FrameBuffer>>& buffers =
-                allocator_->buffers(sc.stream());
-
-            std::lock_guard<std::mutex> lock(bufferMutex_);
-            for (unsigned int i = 0; i < buffers.size(); ++i) {
-                buffers_.push_back(std::move(buffers[i]));
             }
         }
 
         if (!initializeGstreamerPipeline(width, height, fps)) {
             std::cerr << "Failed to initialize GStreamer pipeline" << std::endl;
+            ScopedUnlockUniqueLock un(cameraLock);
             rollbackFailedVideoStart();
             return false;
         }
 
-        if (videoRequestCompletedConn_) {
-            videoRequestCompletedConn_->disconnect();
-            videoRequestCompletedConn_.reset();
-        }
+        disconnectVideoRequestSlot();
+#if SURFCAM_LIBCAMERA_LEGACY
+        camera_->requestCompleted.connect(this, &CameraManager::requestComplete);
+        videoRequestSlotConnected_ = true;
+#else
         videoRequestCompletedConn_.emplace(
             camera_->requestCompleted.connect(this, &CameraManager::requestComplete));
+#endif
 
         if (camera_->start() != 0) {
             std::cerr << "Failed to start camera for video" << std::endl;
+            ScopedUnlockUniqueLock un(cameraLock);
             rollbackFailedVideoStart();
             return false;
         }
 
-        for (const auto& buffer : buffers_) {
+        libcamera::Stream* primaryStream = currentConfig_->at(0).stream();
+        const auto& videoBuffers = allocator_->buffers(primaryStream);
+        for (const auto& bufferHolder : videoBuffers) {
+            if (!bufferHolder) {
+                continue;
+            }
+            libcamera::FrameBuffer* buffer = bufferHolder.get();
+
             auto request = camera_->createRequest();
             if (!request) {
                 std::cerr << "Failed to create request" << std::endl;
+                ScopedUnlockUniqueLock un(cameraLock);
                 rollbackFailedVideoStart();
                 return false;
             }
 
-            const auto stream = currentConfig_->at(0).stream();
-            if (request->addBuffer(stream, buffer.get()) < 0) {
+            if (request->addBuffer(primaryStream, buffer) < 0) {
                 std::cerr << "Failed to add buffer to request" << std::endl;
+                ScopedUnlockUniqueLock un(cameraLock);
                 rollbackFailedVideoStart();
                 return false;
             }
 
             if (camera_->queueRequest(request.get()) != 0) {
                 std::cerr << "Failed to queue request" << std::endl;
+                ScopedUnlockUniqueLock un(cameraLock);
                 rollbackFailedVideoStart();
                 return false;
             }
@@ -554,12 +619,14 @@ bool CameraManager::startVideoMode(int width, int height, int fps) {
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Exception starting video mode: " << e.what() << std::endl;
+        ScopedUnlockUniqueLock un(cameraLock);
         rollbackFailedVideoStart();
         return false;
     }
 }
 
 bool CameraManager::stopVideoMode() {
+    std::lock_guard<std::mutex> tdLock(videoTeardownMutex_);
     if (!isVideoMode_) {
         return true;
     }
@@ -568,14 +635,9 @@ bool CameraManager::stopVideoMode() {
         captureActive_.store(false, std::memory_order_release);
         shuttingDown_.store(true, std::memory_order_release);
 
-        if (videoRequestCompletedConn_) {
-            videoRequestCompletedConn_->disconnect();
-            videoRequestCompletedConn_.reset();
-        }
+        disconnectVideoRequestSlot();
 
-        if (camera_ && camera_->isRunning()) {
-            camera_->stop();
-        }
+        stopCameraIfRunning(camera_.get());
 
         {
             std::lock_guard<std::mutex> lock(cameraOpsMutex_);
@@ -590,7 +652,6 @@ bool CameraManager::stopVideoMode() {
         {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             allocator_.reset();
-            buffers_.clear();
         }
 
         shuttingDown_.store(false, std::memory_order_release);
@@ -604,6 +665,21 @@ bool CameraManager::stopVideoMode() {
     }
 }
 
+void CameraManager::recycleVideoRequest(libcamera::Request* request) {
+    request->reuse();
+    if (!camera_) {
+        return;
+    }
+#if !SURFCAM_LIBCAMERA_LEGACY
+    if (!camera_->isRunning()) {
+        return;
+    }
+#endif
+    if (camera_->queueRequest(request) != 0) {
+        std::cerr << "Failed to re-queue request after reuse" << std::endl;
+    }
+}
+
 void CameraManager::requestComplete(libcamera::Request* request) {
     if (request->status() == libcamera::Request::RequestCancelled) {
         return;
@@ -612,45 +688,72 @@ void CameraManager::requestComplete(libcamera::Request* request) {
     const bool allowPipeline =
         captureActive_.load(std::memory_order_acquire) && !shuttingDown_.load(std::memory_order_acquire);
     if (!allowPipeline) {
+        recycleVideoRequest(request);
         return;
     }
 
     auto buffers = request->buffers();
     for (auto& [stream, buffer] : buffers) {
+        GstElement* appsrc = appsrc_;
+        if (!appsrc) {
+            continue;
+        }
+
+#if SURFCAM_LIBCAMERA_LEGACY
+        LegacyMappedPlane mapped;
+        if (!mapped.mapRead(buffer)) {
+            continue;
+        }
+        const std::size_t nbytes = mapped.size();
+        GstBuffer* gstBuffer = gst_buffer_new_allocate(nullptr, nbytes, nullptr);
+        if (!gstBuffer) {
+            continue;
+        }
+        GstMapInfo map;
+        if (gst_buffer_map(gstBuffer, &map, GST_MAP_WRITE)) {
+            memcpy(map.data, mapped.data(), nbytes);
+            gst_buffer_unmap(gstBuffer, &map);
+            GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+            GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+            GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
+            if (ret != GST_FLOW_OK) {
+                std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
+                gst_buffer_unref(gstBuffer);
+            }
+        } else {
+            gst_buffer_unref(gstBuffer);
+        }
+#else
         auto planes = buffer->planes();
         auto span = planes[0].map();
 
         if (span) {
-            GstElement* appsrc = appsrc_;
-            if (appsrc) {
-                GstBuffer* gstBuffer = gst_buffer_new_allocate(nullptr, span.size(), nullptr);
+            GstBuffer* gstBuffer = gst_buffer_new_allocate(nullptr, span.size(), nullptr);
 
-                if (gstBuffer) {
-                    GstMapInfo map;
-                    if (gst_buffer_map(gstBuffer, &map, GST_MAP_WRITE)) {
-                        memcpy(map.data, span.data(), span.size());
-                        gst_buffer_unmap(gstBuffer, &map);
+            if (gstBuffer) {
+                GstMapInfo map;
+                if (gst_buffer_map(gstBuffer, &map, GST_MAP_WRITE)) {
+                    memcpy(map.data, span.data(), span.size());
+                    gst_buffer_unmap(gstBuffer, &map);
 
-                        GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
-                        GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+                    GST_BUFFER_PTS(gstBuffer) = GST_CLOCK_TIME_NONE;
+                    GST_BUFFER_DTS(gstBuffer) = GST_CLOCK_TIME_NONE;
 
-                        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
-                        if (ret != GST_FLOW_OK) {
-                            std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
-                            gst_buffer_unref(gstBuffer);
-                        }
-                    } else {
+                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gstBuffer);
+                    if (ret != GST_FLOW_OK) {
+                        std::cerr << "Failed to push buffer to GStreamer: " << ret << std::endl;
                         gst_buffer_unref(gstBuffer);
                     }
+                } else {
+                    gst_buffer_unref(gstBuffer);
                 }
             }
-
             planes[0].unmap();
         }
-
-        request->reuse();
-        camera_->queueRequest(request);
+#endif
     }
+
+    recycleVideoRequest(request);
 }
 
 bool CameraManager::reinitialize() {
@@ -665,9 +768,7 @@ bool CameraManager::reinitialize() {
 
     try {
         if (camera_) {
-            if (camera_->isRunning()) {
-                camera_->stop();
-            }
+            stopCameraIfRunning(camera_.get());
             camera_->release();
             camera_.reset();
         }
@@ -680,7 +781,6 @@ bool CameraManager::reinitialize() {
         {
             std::lock_guard<std::mutex> lock(bufferMutex_);
             allocator_.reset();
-            buffers_.clear();
         }
 
         shutdownGstreamerPipeline();
@@ -710,6 +810,20 @@ bool CameraManager::reinitialize() {
         std::cerr << "Exception reinitializing camera: " << e.what() << std::endl;
         return false;
     }
+}
+
+void CameraManager::disconnectVideoRequestSlot() {
+#if SURFCAM_LIBCAMERA_LEGACY
+    if (camera_ && videoRequestSlotConnected_) {
+        camera_->requestCompleted.disconnect(this);
+        videoRequestSlotConnected_ = false;
+    }
+#else
+    if (videoRequestCompletedConn_) {
+        videoRequestCompletedConn_->disconnect();
+        videoRequestCompletedConn_.reset();
+    }
+#endif
 }
 
 }  // namespace SurfCam

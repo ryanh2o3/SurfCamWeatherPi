@@ -141,6 +141,11 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
         try {
             bool streamRequested = api.isStreamingRequested(SurfCam::Config::SPOT_ID);
 
+            // Re-check after blocking API work so shutdown cannot start a new HLS session mid-iteration.
+            if (!keepRunning.load(std::memory_order_acquire)) {
+                continue;
+            }
+
             auto now = std::chrono::system_clock::now();
             auto nowSeconds =
                 std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
@@ -155,15 +160,17 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
                 (nowSeconds - lastStreamRequestTime.load(std::memory_order_acquire) <
                  SurfCam::Config::STREAM_TIMEOUT.count());
 
-            if (shouldStream && (!streamThread || !streamThread->joinable())) {
-                std::cout << "[" << getCurrentTimeString() << "] Starting HLS upload session..." << std::endl;
-                streamShouldRun.store(true);
-                streamThread = std::make_unique<std::thread>(streamHlsWorker, std::ref(camera), std::ref(api));
-                failureCount = 0;
-            } else if (!shouldStream && streamThread && streamThread->joinable()) {
-                std::cout << "[" << getCurrentTimeString() << "] Stopping HLS session..." << std::endl;
-                stopHlsStreamSession();
-                failureCount = 0;
+            if (keepRunning.load(std::memory_order_acquire)) {
+                if (shouldStream && (!streamThread || !streamThread->joinable())) {
+                    std::cout << "[" << getCurrentTimeString() << "] Starting HLS upload session..." << std::endl;
+                    streamShouldRun.store(true);
+                    streamThread = std::make_unique<std::thread>(streamHlsWorker, std::ref(camera), std::ref(api));
+                    failureCount = 0;
+                } else if (!shouldStream && streamThread && streamThread->joinable()) {
+                    std::cout << "[" << getCurrentTimeString() << "] Stopping HLS session..." << std::endl;
+                    stopHlsStreamSession();
+                    failureCount = 0;
+                }
             }
 
         } catch (const std::exception& e) {
@@ -171,7 +178,7 @@ void streamCheckWorker(SurfCam::CameraManager& camera, SurfCam::ApiClient& api) 
             failureCount++;
         }
 
-        if (failureCount > 3) {
+        if (failureCount > 3 && keepRunning.load(std::memory_order_acquire)) {
             std::cerr << "[" << getCurrentTimeString() << "] Multiple failures, attempting recovery" << std::endl;
 
             stopHlsStreamSession();

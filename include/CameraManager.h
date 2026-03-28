@@ -37,7 +37,9 @@ namespace SurfCam {
 /// 1. Set captureActive_ / shuttingDown_ (memory_order_seq_cst).
 /// 2. Disconnect video requestCompleted slot, then camera_->stop() (RequestCancelled in requestComplete).
 /// 3. shutdownGstreamerPipeline().
-/// 4. Release allocator_ / clear buffers_ under bufferMutex_.
+/// 4. Release allocator_ under bufferMutex_ (frame buffers stay owned by the allocator).
+/// videoTeardownMutex_ serializes stopVideoMode vs rollbackFailedVideoStart; startVideoMode unlocks
+/// cameraOpsMutex_ before calling rollback so lock order cannot deadlock with stop.
 /// Only streamCheckWorker and main join the HLS worker thread (see main.cpp — strategy A).
 class CameraManager {
 public:
@@ -56,7 +58,6 @@ private:
     std::shared_ptr<libcamera::Camera> camera_;
     std::unique_ptr<libcamera::CameraConfiguration> currentConfig_;
     std::unique_ptr<libcamera::FrameBufferAllocator> allocator_;
-    std::vector<std::shared_ptr<libcamera::FrameBuffer>> buffers_;
     std::mutex bufferMutex_;
     std::condition_variable bufferCV_;
 
@@ -78,12 +79,16 @@ private:
     GstBus* bus_{nullptr};
     GMainLoop* loop_{nullptr};
     std::thread gstThread_;
-    bool gstRunning_{false};
+    std::atomic<bool> gstRunning_{false};
+
+    /// Serializes stopVideoMode vs rollbackFailedVideoStart (and overlapping teardown). Not held in requestComplete.
+    std::mutex videoTeardownMutex_;
 
     bool initializeGstreamerPipeline(int width, int height, int fps);
     void shutdownGstreamerPipeline();
     /// Tear down partial/failed video startup (no isVideoMode_).
     void rollbackFailedVideoStart();
+    void recycleVideoRequest(libcamera::Request* request);
     static gboolean onGstMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
 
     // Flags and state
@@ -92,7 +97,13 @@ private:
     bool isVideoMode_{false};
     std::atomic<bool> captureActive_{false};
     std::atomic<bool> shuttingDown_{false};
+#if SURFCAM_LIBCAMERA_LEGACY
+    bool videoRequestSlotConnected_{false};
+#else
     std::optional<libcamera::Connection> videoRequestCompletedConn_;
+#endif
+
+    void disconnectVideoRequestSlot();
 };
 
 }  // namespace SurfCam

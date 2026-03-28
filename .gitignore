@@ -1,6 +1,13 @@
-# Build directories
+# Build directories (CMake)
 build/
+build-*/
+build-pi/
+out/
 cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+Testing/
 *.o
 *.a
 *.so

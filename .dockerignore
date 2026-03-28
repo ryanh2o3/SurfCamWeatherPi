@@ -1,0 +1,12 @@
+# Host CMake output (paths in CMakeCache break in-container builds)
+build/
+build-*/
+build-pi/
+build-tsan/
+build-check/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+.git/
+.cursor/

@@ -1,0 +1,25 @@
+# Full native compile check on macOS/Linux (libcamera is not available on macOS).
+# From repo root:
+#   docker build -f Dockerfile.build -t surfcam-build .
+#   docker run --rm surfcam-build ls -la /src/build/surfcam
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libcurl4-openssl-dev \
+    libcamera-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    gstreamer1.0-plugins-bad \
+    nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+# Fresh configure even if a stale build/ slipped into context
+RUN rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j"$(nproc)"

@@ -67,7 +67,6 @@ Written in C++17. Here's what the main pieces do:
 
 - CMake 3.10+
 - C++17 compiler (gcc or clang)
-- OpenCV
 - libcamera
 - GStreamer 1.0 (including **plugins-bad** for `hlssink`)
 - libcurl
@@ -85,9 +84,6 @@ sudo apt install -y build-essential cmake git pkg-config
 # Camera stuff
 sudo apt install -y libcamera-dev libcamera-apps
 
-# OpenCV
-sudo apt install -y libopencv-dev
-
 # GStreamer (hlssink lives in plugins-bad)
 sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
@@ -99,6 +95,17 @@ sudo apt install -y nlohmann-json3-dev
 ```
 
 ## Building
+
+### Checking compilation on macOS
+
+libcamera and the Pi camera stack are **Linux-only**. To verify that the project still compiles from a Mac, use Docker (no Homebrew OpenCV needed). The build picks **legacy vs modern libcamera** automatically from `pkg-config --modversion libcamera` (Debian bookworm’s 0.0.x uses mmap-based buffer access; Pi OS / newer distros use 0.2+ APIs).
+
+```bash
+./scripts/docker-build.sh
+# or: docker build -f Dockerfile.build -t surfcam-build .
+```
+
+### On the Raspberry Pi (or Linux with deps installed)
 
 ```bash
 # Go to the project directory
